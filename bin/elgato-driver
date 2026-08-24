@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# Load the locally built cx231xx module in place of the in-tree one.
+#
+# Nothing is installed into /lib/modules and nothing is overwritten: the local
+# .ko is inserted with insmod for this boot only. A reboot always returns you
+# to the distro driver, and 'elgato-driver stock' does so immediately.
+#
+# Module parameters can follow 'local' and are passed through to insmod:
+#   elgato-driver local elgato_htl=2 elgato_regs=1
+
+set -uo pipefail
+SELF_DIR=$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd)
+# shellcheck source=../lib/elgato-common.sh
+source "$SELF_DIR/../lib/elgato-common.sh"
+
+BUILD_DIR="$SELF_DIR/../driver/cx231xx"
+KO="$BUILD_DIR/cx231xx.ko"
+KO_ALSA="$BUILD_DIR/cx231xx-alsa.ko"
+
+show_status() {
+    local src
+    src=$(modinfo -n cx231xx 2>/dev/null)
+    if lsmod | grep '^cx231xx ' >/dev/null; then
+        # An insmod'd module reports no filename via modinfo -n resolution
+        # against /lib/modules, so compare srcversion instead.
+        local live built
+        live=$(cat /sys/module/cx231xx/srcversion 2>/dev/null)
+        built=$(modinfo -F srcversion "$KO" 2>/dev/null)
+        if [[ -n $built && $live == "$built" ]]; then
+            echo "loaded driver : LOCAL BUILD ($KO)"
+        else
+            echo "loaded driver : distro in-tree ($src)"
+        fi
+        echo "srcversion    : $live"
+    else
+        echo "loaded driver : cx231xx not loaded"
+    fi
+}
+
+unload() {
+    release_device
+    sudo modprobe -r cx231xx_alsa 2>/dev/null
+    sudo rmmod cx231xx_alsa 2>/dev/null
+    if ! sudo modprobe -r cx231xx 2>/dev/null && ! sudo rmmod cx231xx 2>/dev/null; then
+        warn "Could not unload cx231xx. Still held by:"
+        device_holders
+        restore_wireplumber
+        return 1
+    fi
+    return 0
+}
+
+wait_for_device() {
+    local i
+    for i in $(seq 1 30); do
+        sleep 0.5
+        [[ -c /dev/elgato ]] && break
+    done
+    restore_wireplumber
+    settle
+    msg "Waiting for the chip to start streaming..."
+    wait_until_streaming || warn "device node present but not streaming yet"
+    [[ -c /dev/elgato ]]
+}
+
+use_local() {
+    [[ -f $KO ]] || die "not built yet - run: make -C $BUILD_DIR"
+    unload || return 1
+    if (( $# )); then
+        msg "Inserting locally built modules with: $*"
+    else
+        msg "Inserting locally built modules"
+    fi
+    if ! sudo insmod "$KO" "$@"; then
+        warn "insmod failed; falling back to the distro driver"
+        sudo modprobe cx231xx 2>/dev/null
+        sudo modprobe cx231xx_alsa 2>/dev/null
+        wait_for_device
+        return 1
+    fi
+    [[ -f $KO_ALSA ]] && sudo insmod "$KO_ALSA" 2>/dev/null
+    msg "Waiting for the device to re-register and reload firmware..."
+    wait_for_device
+}
+
+use_stock() {
+    unload || return 1
+    msg "Loading the distro in-tree driver"
+    sudo modprobe cx231xx || { restore_wireplumber; die "could not load cx231xx"; }
+    sudo modprobe cx231xx_alsa 2>/dev/null
+    msg "Waiting for the device to re-register and reload firmware..."
+    wait_for_device
+}
+
+# Any further arguments are module parameters handed straight to insmod, e.g.
+#   elgato-driver local elgato_htl=2 elgato_regs=1
+ACTION=${1:-status}
+shift || true
+
+case "$ACTION" in
+    local)  use_local "$@" && msg "Device ready. Run: nes-quality" ;;
+    stock)  use_stock && msg "Device ready (distro driver)." ;;
+    status) show_status ;;
+    *) die "usage: ${0##*/} {local [param=value ...]|stock|status}" ;;
+esac
