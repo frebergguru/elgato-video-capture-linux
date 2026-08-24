@@ -79,6 +79,9 @@ Play the Elgato Video Capture full-screen-able, low latency, with sound.
       --tune            sweep the driver's elgato_* fix knobs, measure each
                         with --verify and report which one stabilises the
                         picture. Needs root.
+      --quality [SECS]  measure picture quality -- crosstalk, sharpness,
+                        detail and noise -- and exit (default 8s). Use it to
+                        compare settings; --verify checks integrity instead.
       --verify [SECS]   measure frame integrity and exit (default 6s).
                         Reports what fraction of frames the driver assembles
                         correctly -- use it to A/B a driver change.
@@ -113,6 +116,8 @@ DO_RESET=0
 CHECK_ONLY=0
 VERIFY=0
 VERIFY_SECS=6
+QUALITY=0
+QUALITY_SECS=8
 TUNE=0
 BEST_SPEC=""
 
@@ -134,6 +139,9 @@ while (( $# )); do
         --reset)          DO_RESET=1; shift ;;
         --check)          CHECK_ONLY=1; shift ;;
         --tune)           TUNE=1; shift ;;
+        --quality)        QUALITY=1
+                          if [[ ${2:-} =~ ^[0-9]+$ ]]; then QUALITY_SECS=$2; shift; fi
+                          shift ;;
         --verify)         VERIFY=1
                           if [[ ${2:-} =~ ^[0-9]+$ ]]; then VERIFY_SECS=$2; shift; fi
                           shift ;;
@@ -464,6 +472,178 @@ PYEOF
     return $rc
 }
 
+# --------------------------------------------------------------- quality ----
+#
+# --verify answers "is the driver assembling frames correctly". This answers a
+# different question: how clean is the picture it assembles. A capture can score
+# 0% corrupt and still be full of dot crawl.
+#
+# The dominant artefact on composite is chroma/luma crosstalk: the decoder cannot
+# fully separate the two, so luma detail leaks into chroma and chroma speckles
+# along luma edges. Measure it as the ratio of chroma activity beside hard luma
+# edges to chroma activity in flat areas. 1.0 would be perfect separation.
+#
+# Crucially this is reported next to sharpness, never alone. Any low-pass filter
+# improves the crosstalk number by blurring the picture -- measured on this
+# capture, a 3-tap blur takes crosstalk 7.14 -> 5.42 while sharpness collapses
+# 34.0 -> 19.2. A single "quality score" would happily optimise for mush.
+quality_stream() {
+    local dev=$1 secs=$2 raw w h sz
+    read -r w h sz < <(v4l2-ctl -d "$dev" --get-fmt-video 2>/dev/null | awk '
+        /Width\/Height/ { split($3, a, "/"); w = a[1]; h = a[2] }
+        /Size Image/     { sz = $4 }
+        END { print w, h, sz }')
+    [[ -n ${sz:-} && $sz -gt 0 ]] || { err "could not read the capture format"; return 1; }
+
+    local want=$(( secs * 25 ))
+    (( want < 30 )) && want=30
+    raw=$(mktemp) || return 1
+
+    msg "Capturing ${want} frames (${w}x${h}) to measure picture quality..."
+    if ! timeout $(( secs + 15 )) v4l2-ctl -d "$dev" --stream-mmap \
+            --stream-count="$want" --stream-to="$raw" >/dev/null 2>&1; then
+        rm -f "$raw"; err "capture failed"; return 1
+    fi
+
+    python3 - "$raw" "$w" "$h" "$sz" "${3:-report}" <<'PYEOF'
+import sys
+
+path, w, h, sz = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+mode = sys.argv[5] if len(sys.argv) > 5 else "report"
+
+ROW_STEP = 4     # rows sampled
+PIX_STEP = 8     # chroma pairs sampled along a row
+EDGE     = 40    # luma gradient that counts as a hard edge
+FLAT     = 5     # luma gradient that counts as flat
+
+with open(path, 'rb') as fh:
+    data = fh.read()
+n = len(data) // sz
+if n < 8:
+    print("QUALITY=nan")
+    if mode == "report":
+        print("  not enough frames to judge")
+    sys.exit(1)
+
+stride = w * 2
+
+def pct(vals, p):
+    if not vals:
+        return 0.0
+    v = sorted(vals)
+    return float(v[min(len(v) - 1, int(len(v) * p / 100.0))])
+
+# --- spatial metrics, measured on many frames across the capture -------------
+# Reading a single frame ties every figure to whatever was on screen at that
+# instant: on a moving source the same setting measured 89 one run and 6 the
+# next. Sampling frames spread through the capture and taking the median makes
+# the result describe the setting rather than the moment. The spread is reported
+# too, so content variability is visible instead of hidden.
+FRAMES = 12
+picks = [int(round(i * (n - 1) / float(FRAMES - 1))) for i in range(FRAMES)] \
+        if n >= FRAMES else list(range(n))
+
+xs = list(range(20, h - 4, ROW_STEP))
+cs, ss, vs = [], [], []
+for fi in picks:
+    base = fi * sz
+    edge_c, flat_c, hgrad, vgrad = [], [], [], []
+    for y in xs:
+        o1 = base + y * stride
+        o2 = base + (y + 2) * stride      # two rows down: crosses a doubled line
+        for x in range(0, w * 2 - 8, 4 * PIX_STEP):
+            g = abs(data[o1 + x] - data[o1 + x + 4])
+            hgrad.append(g)
+            vgrad.append(abs(data[o1 + x] - data[o2 + x]))
+            dc = abs(data[o1 + x + 1] - data[o1 + x + 5]) \
+               + abs(data[o1 + x + 3] - data[o1 + x + 7])
+            if g > EDGE:
+                edge_c.append(dc)
+            elif g < FLAT:
+                flat_c.append(dc)
+    if edge_c and flat_c:
+        cs.append((sum(edge_c) / len(edge_c)) / max(sum(flat_c) / len(flat_c), 0.01))
+    ss.append(pct(hgrad, 95))
+    vs.append(pct(vgrad, 95))
+
+if not cs:
+    print("QUALITY=nan")
+    if mode == "report":
+        print("  the picture has too little contrast to measure crosstalk")
+    sys.exit(1)
+
+crosstalk = pct(cs, 50)
+ct_lo, ct_hi = min(cs), max(cs)
+sharp = pct(ss, 50)
+vdet = pct(vs, 50)
+
+# --- temporal noise ----------------------------------------------------------
+# Per-pixel standard deviation over time. Moving pixels dominate the high end, so
+# the median is the noise floor of the static majority.
+spots = []
+for y in range(20, h - 4, ROW_STEP * 4):
+    for x in range(0, w * 2 - 8, 4 * PIX_STEP * 2):
+        spots.append(y * stride + x)
+sds = []
+static = 0
+for off in spots:
+    vals = [data[i * sz + off] for i in range(n)]
+    m = sum(vals) / n
+    sd = (sum((v - m) ** 2 for v in vals) / n) ** 0.5
+    sds.append(sd)
+    if sd < 2.0:
+        static += 1
+noise = pct(sds, 50)
+static_frac = 100.0 * static / len(sds)
+
+# Scene drift. These figures describe whatever the source happened to be showing,
+# so comparing two configurations is only meaningful if the picture held still
+# between them. Measured here by how far the last frame has moved from the first.
+drift = sum(abs(data[0 * sz + o] - data[(n - 1) * sz + o]) for o in spots) / len(spots)
+
+if mode != "report":
+    print("QUALITY=%.4f %.4f %.4f %.4f %.4f" % (crosstalk, sharp, vdet, noise, drift))
+    sys.exit(0)
+
+print("  frames analysed : %d" % n)
+print("  crosstalk ratio : %5.2f   chroma activity at luma edges vs flat areas"
+      % crosstalk)
+print("                            median of %d frames, range %.2f-%.2f"
+      % (len(cs), ct_lo, ct_hi))
+print("                            1.00 = perfect separation; higher = dot crawl")
+print("  sharpness       : %5.1f   horizontal luma detail  <- the guard" % sharp)
+print("  v-detail        : %5.1f   vertical luma detail" % vdet)
+print("  noise           : %5.2f   temporal, %.0f%% of pixels static"
+      % (noise, static_frac))
+print("  scene drift     : %5.2f   how far the picture moved during capture" % drift)
+print()
+if drift > 3.0 or static_frac < 40:
+    print("  WARNING: the source is moving (drift %.1f, %.0f%% static), so these"
+          % (drift, static_frac))
+    print("  figures are NOT comparable between runs. Measured five times on a")
+    print("  moving picture, this metric swung 8.1 to 18.5 for an unchanged")
+    print("  setting -- content dominates entirely.")
+    print()
+    print("  Crosstalk is most objectionable in motion, but it cannot be measured")
+    print("  there. Hold the source still (pause, or a title screen with plenty of")
+    print("  texture) to compare settings, then judge the winner by eye on moving")
+    print("  material. On a still scene this metric repeats to about +/-1.5%.")
+    print()
+elif sharp < 12 or vdet < 12:
+    print("  WARNING: the picture has very little detail (sharpness %.0f, v-detail"
+          % sharp)
+    print("  %.0f). Crosstalk needs hard edges to be visible. Use a screen with" % vdet)
+    print("  some texture and contrast rather than a dark or flat one.")
+    print()
+print("  These are for COMPARING configurations, not a pass/fail. A change is an")
+print("  improvement only if crosstalk falls while sharpness holds -- any blur")
+print("  lowers crosstalk by destroying detail.")
+PYEOF
+    local rc=$?
+    rm -f "$raw"
+    return $rc
+}
+
 # Capture once and return just the ratio, for the sweep below.
 measure_ratio() {
     verify_stream "$1" "$2" quiet 2>/dev/null | sed -n 's/^RATIO=//p'
@@ -669,6 +849,11 @@ preflight "$DEVICE" || exit 1
 
 if (( TUNE )); then
     tune_sweep
+    exit $?
+fi
+
+if (( QUALITY )); then
+    quality_stream "$DEVICE" "$QUALITY_SECS"
     exit $?
 fi
 
