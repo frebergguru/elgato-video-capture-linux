@@ -85,7 +85,13 @@ Play the Elgato Video Capture full-screen-able, low latency, with sound.
   -d, --device PATH     V4L2 node (default: autodetect)
   -h, --help            this
 
-To quit: close the window, or press Ctrl-C in this terminal.
+Keys (with the video window focused):
+  f     fullscreen on/off        m     mute/unmute the capture audio
+  z     smaller window           h     show these keys on screen
+  x     larger window            q     quit   (Esc closes help, or quits)
+
+Keys need python-gobject, gtk4 and gst-plugin-gtk4. Without them it still
+plays; close the window or press Ctrl-C to quit.
 
 If it will not start, run  elgato-doctor  for a full diagnosis.
 EOF
@@ -573,7 +579,46 @@ tune_sweep() {
 
 # ------------------------------------------------------------------ sink ----
 
+# The interactive player needs PyGObject, GTK4 and gtk4paintablesink. Where any
+# of those is missing -- other distros do not all ship gst-plugin-gtk4 -- fall
+# back to gst-launch, which plays fine but cannot take a key press: gst-launch
+# has no input plumbing, and waylandsink does not implement GstNavigation.
+PLAYER="$SELF_DIR/../libexec/elgato-player.py"
+
+have_player() {
+    [[ -r $PLAYER ]] || return 1
+    command -v python3 >/dev/null || return 1
+    gst-inspect-1.0 gtk4paintablesink >/dev/null 2>&1 || return 1
+    python3 - <<'EOF' >/dev/null 2>&1 || return 1
+import gi
+gi.require_version("Gst", "1.0"); gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
+from gi.repository import Gst, Gtk, Gdk
+EOF
+    return 0
+}
+
+# Decided once in the main shell, never inside pick_sink: that runs in a command
+# substitution, so anything it assigns is lost with the subshell.
+USE_PLAYER=0
+
+decide_player() {
+    if [[ -n ${ELGATO_VIEWER_SINK:-} ]]; then
+        return              # an explicit sink override opts out, silently
+    fi
+    if have_player; then
+        USE_PLAYER=1
+        return
+    fi
+    warn "interactive keys unavailable -- needs python-gobject, gtk4 and"
+    warn "gst-plugin-gtk4. Playing without them; close the window or Ctrl-C to quit."
+}
+
 pick_sink() {
+    if (( USE_PLAYER )); then
+        echo "gtk4paintablesink name=vsink sync=false"
+        return
+    fi
     if [[ -n ${ELGATO_VIEWER_SINK:-} ]]; then
         echo "$ELGATO_VIEWER_SINK"
     elif [[ -n ${WAYLAND_DISPLAY:-} ]] && gst-inspect-1.0 waylandsink >/dev/null 2>&1; then
@@ -655,6 +700,7 @@ case "$DEINTERLACE" in
     linear) DEINT="deinterlace mode=interlaced method=linear ! " ;;
 esac
 
+decide_player
 SINK=$(pick_sink)
 
 PIPELINE="v4l2src device=$DEVICE io-mode=mmap
@@ -662,13 +708,17 @@ PIPELINE="v4l2src device=$DEVICE io-mode=mmap
     ! capssetter caps=video/x-raw,pixel-aspect-ratio=(fraction)$SRC_PAR
     ! ${DEINT}videoconvert
     ! videoscale method=$SCALE_METHOD
-    ! video/x-raw,width=$OUT_W,height=$OUT_H,pixel-aspect-ratio=(fraction)1/1
+    ! capsfilter name=outcaps caps=video/x-raw,width=$OUT_W,height=$OUT_H,pixel-aspect-ratio=(fraction)1/1
     ! $SINK"
 
 trap cleanup EXIT INT TERM
 start_audio
 
-msg "Playing ${OUT_W}x${OUT_H}$( ((FULLSCREEN)) && echo " fullscreen")  (close the window or Ctrl-C to quit)"
+if (( USE_PLAYER )); then
+    msg "Playing ${OUT_W}x${OUT_H}$( ((FULLSCREEN)) && echo " fullscreen")  (press h in the window for keys)"
+else
+    msg "Playing ${OUT_W}x${OUT_H}$( ((FULLSCREEN)) && echo " fullscreen")  (close the window or Ctrl-C to quit)"
+fi
 
 # A first STREAMON occasionally fails on a box that has just been reset or
 # replugged -- the alt-setting change races the decoder coming up. One retry
@@ -676,8 +726,17 @@ msg "Playing ${OUT_W}x${OUT_H}$( ((FULLSCREEN)) && echo " fullscreen")  (close t
 attempt=0
 while :; do
     attempt=$((attempt + 1))
-    # shellcheck disable=SC2086  # the pipeline description must word-split
-    gst-launch-1.0 -q $PIPELINE &
+    if (( USE_PLAYER )); then
+        "$PLAYER" --pipeline "$PIPELINE" \
+                  --width "$OUT_W" --height "$OUT_H" \
+                  $( ((FULLSCREEN)) && echo --fullscreen ) \
+                  --audio-helper "$SELF_DIR/elgato-audio" \
+                  --device "$DEVICE" --input "$INPUT_NAME" \
+                  --title "Elgato Video Capture" &
+    else
+        # shellcheck disable=SC2086  # the pipeline description must word-split
+        gst-launch-1.0 -q $PIPELINE &
+    fi
     GST_PID=$!
     wait "$GST_PID"
     rc=$?

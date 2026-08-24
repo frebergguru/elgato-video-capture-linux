@@ -67,7 +67,25 @@ elgato-viewer --input svideo
 elgato-viewer --reset              # power-cycle first
 ```
 
-Close the window or press Ctrl-C to quit. `--help` lists everything.
+### Keys
+
+With the video window focused:
+
+| key | |
+| --- | --- |
+| `f` | fullscreen on/off |
+| `z` / `x` | smaller / larger window |
+| `m` | mute/unmute the capture audio — other apps keep playing |
+| `h` | show the keys on screen |
+| `q` | quit |
+| `Esc` | close the help overlay, or quit |
+
+`--help` lists the command-line options.
+
+Keys need `python-gobject`, `gtk4` and `gst-plugin-gtk4`. Without them the viewer
+still plays, but there is nothing to press: `gst-launch-1.0` has no keyboard
+plumbing, and `waylandsink` does not implement `GstNavigation`, so a key press
+never reaches it. Close the window or press Ctrl-C instead.
 
 ### How it stays stable
 

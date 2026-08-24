@@ -100,6 +100,13 @@ start() {
         stop
         return 1
     fi
+
+    # WirePlumber remembers mute state per node name, so a session that quit
+    # while muted brings the next one up silent -- with nothing on screen to
+    # explain why. Starting the loopback should always mean audible audio.
+    local id
+    id=$(loopback_node_id)
+    [[ -n $id ]] && wpctl set-mute "$id" 0 >/dev/null 2>&1
     return 0
 }
 
@@ -128,16 +135,68 @@ stop() {
     fi
 }
 
+# ------------------------------------------------------------------ mute ----
+#
+# Mute the loopback rather than the default sink, so silencing the capture
+# leaves music, chat and everything else playing.
+#
+# pw-loopback names its playback node elgato-audio-out (see start()), which
+# gives us a stable handle. wpctl wants a numeric id, and jq is not a
+# dependency worth adding for one lookup, so walk pw-cli's output instead: it
+# prints "id N," on its own line before each object's properties.
+loopback_node_id() {
+    pw-cli ls Node 2>/dev/null | awk '
+        /^[[:space:]]*id [0-9]+,/ { id = $2; sub(",", "", id) }
+        /node\.name = "elgato-audio-out"/ { print id; exit }'
+}
+
+# Report the resulting state as a single word on stdout. Callers -- the viewer's
+# m key in particular -- display what actually happened rather than assuming the
+# toggle went the way they expected, so this must be the state after the change,
+# read back rather than predicted.
+mute_state() {
+    local id=$1
+    if wpctl get-volume "$id" 2>/dev/null | grep -q '\[MUTED\]'; then
+        echo muted
+    else
+        echo unmuted
+    fi
+}
+
+set_mute() {
+    local how=$1 id
+    id=$(loopback_node_id)
+    if [[ -z $id ]]; then
+        if is_running; then
+            warn "the loopback is running but PipeWire has no elgato-audio-out node yet"
+        else
+            warn "the audio loopback is not running -- nothing to mute"
+        fi
+        return 1
+    fi
+    command -v wpctl >/dev/null || { warn "wpctl is not installed"; return 1; }
+    wpctl set-mute "$id" "$how" >/dev/null 2>&1 || { warn "wpctl set-mute failed"; return 1; }
+    mute_state "$id"
+}
+
 case "${1:-start}" in
     start)   start ;;
     stop)    stop ;;
     restart) stop; start ;;
+    mute)        set_mute 1 ;;
+    unmute)      set_mute 0 ;;
+    mute-toggle) set_mute toggle ;;
     status)
         if is_running; then
-            echo "running (pid $(<"$PID_FILE"))"
+            id=$(loopback_node_id)
+            if [[ -n $id ]]; then
+                echo "running (pid $(<"$PID_FILE"), $(mute_state "$id"))"
+            else
+                echo "running (pid $(<"$PID_FILE"))"
+            fi
         else
             echo "stopped"; exit 1
         fi
         ;;
-    *) die "usage: ${0##*/} {start|stop|restart|status}" ;;
+    *) die "usage: ${0##*/} {start|stop|restart|status|mute|unmute|mute-toggle}" ;;
 esac
