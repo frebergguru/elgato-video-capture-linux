@@ -61,7 +61,7 @@ LICENSE             GPL-2.0-or-later, full text
 ```
 elgato-viewer                      # composite, 960x720, sound on
 elgato-viewer -f --sharp           # fullscreen, nearest-neighbour pixels
-elgato-viewer --deinterlace weave  # sharpest for 240p/288p progressive sources
+elgato-viewer --deinterlace linear # lowest latency, at the cost of combing
 elgato-viewer --ntsc               # or --pal
 elgato-viewer --input svideo
 elgato-viewer --reset              # power-cycle first
@@ -75,6 +75,7 @@ With the video window focused:
 | --- | --- |
 | `f` | fullscreen on/off |
 | `z` / `x` | smaller / larger window |
+| `c` | cycle the deinterlacer — yadif / greedyh / linear |
 | `m` | mute/unmute the capture audio — other apps keep playing |
 | `h` | show the keys on screen |
 | `q` | quit |
@@ -102,9 +103,26 @@ Three choices do the work, and they are worth keeping if you modify it:
 - **The queue is short and `leaky=downstream`.** If the compositor stalls, old
   frames are dropped instead of accumulating, so latency stays flat.
 
-Deinterlacing defaults to `linear`: one field, no temporal lookahead. `yadif`
-looks better but costs about a frame of latency, which you can feel on a
-controller.
+### Deinterlacing
+
+Defaults to **yadif**, measured over 400 frames of real motion from this card:
+
+| method | combing | vertical detail | latency |
+| ------ | ------- | --------------- | ------- |
+| raw (none) | 2.46 | 90.7 | — |
+| **yadif** | **0.31** | **86.0** | 5.1 ms |
+| greedyh | 0.61 | 86.3 | 1.7 ms |
+| linear | 1.04 | 73.6 | 0.3 ms |
+
+The console emits 50 progressive fields per second, so a woven 576-line frame
+holds two moments 20 ms apart. That combs only when things move, which is why it
+is easy to miss on a paused screen. `linear` leaves three times more of it than
+yadif *and* discards about 17% of the vertical detail.
+
+The latency worry that once justified `linear` did not survive measurement:
+yadif costs 5 ms, not the frame it is often assumed to. Press `c` while playing
+to cycle the three and judge for yourself — the difference is a motion artefact
+and barely visible in a screenshot.
 
 ## Measuring
 

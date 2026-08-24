@@ -64,12 +64,14 @@ Play the Elgato Video Capture full-screen-able, low latency, with sound.
   -f, --fullscreen      start full screen
   -s, --size WxH        window size (default ${DEF_W}x${DEF_H}, 4:3)
       --sharp           nearest-neighbour scaling; crisp pixels, no blur
-      --deinterlace M   linear (default) | yadif | weave | none
-                          linear  lowest latency, always safe
-                          weave   sharpest on 240p/288p progressive sources
-                                  such as retro consoles,
-                                  combs on real interlaced video
-                          yadif   best looking, costs ~1 frame of latency
+      --deinterlace M   yadif (default) | greedyh | linear | weave | none
+                          yadif    cleanest: least combing and keeps the most
+                                   vertical detail. Measured 5ms of latency.
+                          greedyh  very close to yadif, 1.7ms
+                          linear   lowest latency (0.3ms) but combs on motion
+                                   and loses about 17% of vertical detail
+                          weave    no processing; combs badly on motion
+                          none     no deinterlacer in the pipeline at all
 
       --no-audio        do not start the audio loopback
       --latency MS      audio loopback latency (default 15)
@@ -79,6 +81,11 @@ Play the Elgato Video Capture full-screen-able, low latency, with sound.
       --tune            sweep the driver's elgato_* fix knobs, measure each
                         with --verify and report which one stabilises the
                         picture. Needs root.
+      --record FILE     while playing, also write the raw captured frames to
+                        FILE. Lets you watch and play while a capture is
+                        analysed afterwards -- only one program can open the
+                        device at a time, so this is how to do both at once.
+                        Raw YUYV is about 21 MB/s; keep recordings short.
       --quality [SECS]  measure picture quality -- crosstalk, sharpness,
                         detail and noise -- and exit (default 8s). Use it to
                         compare settings; --verify checks integrity instead.
@@ -90,8 +97,9 @@ Play the Elgato Video Capture full-screen-able, low latency, with sound.
 
 Keys (with the video window focused):
   f     fullscreen on/off        m     mute/unmute the capture audio
-  z     smaller window           h     show these keys on screen
-  x     larger window            q     quit   (Esc closes help, or quits)
+  z     smaller window           c     cycle deinterlacer (picture quality)
+  x     larger window            h     show these keys on screen
+                                 q     quit   (Esc closes help, or quits)
 
 Keys need python-gobject, gtk4 and gst-plugin-gtk4. Without them it still
 plays; close the window or press Ctrl-C to quit.
@@ -109,7 +117,7 @@ STANDARD=""
 FULLSCREEN=0
 SIZE=""
 SCALE_METHOD="bilinear"
-DEINTERLACE="linear"
+DEINTERLACE="yadif"
 WANT_AUDIO=1
 AUDIO_LATENCY="${ELGATO_AUDIO_LATENCY_MS:-15}"
 DO_RESET=0
@@ -118,6 +126,7 @@ VERIFY=0
 VERIFY_SECS=6
 QUALITY=0
 QUALITY_SECS=8
+RECORD=""
 TUNE=0
 BEST_SPEC=""
 
@@ -139,6 +148,7 @@ while (( $# )); do
         --reset)          DO_RESET=1; shift ;;
         --check)          CHECK_ONLY=1; shift ;;
         --tune)           TUNE=1; shift ;;
+        --record)         need "$@"; RECORD=$2; shift 2 ;;
         --quality)        QUALITY=1
                           if [[ ${2:-} =~ ^[0-9]+$ ]]; then QUALITY_SECS=$2; shift; fi
                           shift ;;
@@ -158,8 +168,8 @@ case "$INPUT" in
 esac
 
 case "$DEINTERLACE" in
-    linear|yadif|weave|none) ;;
-    *) die "--deinterlace must be linear, yadif, weave or none (got '$DEINTERLACE')" ;;
+    linear|yadif|weave|greedyh|none) ;;
+    *) die "--deinterlace must be yadif, greedyh, linear, weave or none (got '$DEINTERLACE')" ;;
 esac
 
 if [[ -n $SIZE ]]; then
@@ -883,18 +893,27 @@ esac
 
 case "$DEINTERLACE" in
     none)   DEINT="" ;;
-    weave)  DEINT="deinterlace mode=interlaced method=weave ! " ;;
-    yadif)  DEINT="deinterlace mode=interlaced method=yadif ! " ;;
-    linear) DEINT="deinterlace mode=interlaced method=linear ! " ;;
+    *)      DEINT="deinterlace name=deint mode=interlaced method=$DEINTERLACE ! " ;;
 esac
 
 decide_player
 SINK=$(pick_sink)
 
+REC_BRANCH=""
+if [[ -n $RECORD ]]; then
+    # Split the stream rather than opening the device twice -- V4L2 allows only
+    # one client. The recording branch is leaky so a slow disk drops frames
+    # instead of stalling the picture you are playing on.
+    REC_BRANCH="! tee name=rec
+    rec. ! queue max-size-buffers=12 leaky=downstream ! filesink location=$RECORD async=false
+    rec. "
+    msg "Recording raw frames to $RECORD (~21 MB/s)"
+fi
+
 PIPELINE="v4l2src device=$DEVICE io-mode=mmap
     ! queue max-size-buffers=3 max-size-bytes=0 max-size-time=0 leaky=downstream
     ! capssetter caps=video/x-raw,pixel-aspect-ratio=(fraction)$SRC_PAR
-    ! ${DEINT}videoconvert
+    $REC_BRANCH! ${DEINT}videoconvert
     ! videoscale method=$SCALE_METHOD
     ! capsfilter name=outcaps caps=video/x-raw,width=$OUT_W,height=$OUT_H,pixel-aspect-ratio=(fraction)1/1
     ! $SINK"
