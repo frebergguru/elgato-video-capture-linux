@@ -1,0 +1,124 @@
+# Incremental on 0002 -- field-sequence counters; also makes the bulk path report.
+--- prev/cx231xx-video.c
++++ cx231xx/cx231xx-video.c
+@@ -271,12 +271,80 @@
+ static unsigned long cxdbg_urbs, cxdbg_pkts, cxdbg_err, cxdbg_eproto;
+ static unsigned long cxdbg_empty, cxdbg_big, cxdbg_skip_midline;
+ 
++/*
++ * Field-sequence instrumentation.
++ *
++ * skip_midline was measured at ~3.5% of frames while ~70-85% of delivered
++ * frames are spliced, and the fault is identical in ISO and BULK mode, so the
++ * cause is in the shared line/field assembler rather than in the transport.
++ *
++ * cx231xx_is_buffer_done() only ever completes a buffer on field 2, and only
++ * when field1_done is set. So the assembler assumes the chip emits a strict
++ * 1,2,1,2,... sequence of exactly lines_per_field lines each. If the chip
++ * repeats a field, or ends one early, a buffer absorbs the wrong number of
++ * fields and every row written after that point belongs to a different moment.
++ *
++ * These counters test that assumption directly:
++ *   f1->2 / f2->1  the transitions the assembler expects
++ *   odd            a transition that is neither (a repeated field)
++ *   short/exact/over  lines actually delivered in the field that just ended,
++ *                  against lines_per_field
++ */
++static unsigned long cxdbg_f12, cxdbg_f21, cxdbg_fodd;
++static unsigned long cxdbg_short, cxdbg_exact, cxdbg_over;
++/* How short is short? One line is a timing tweak; a hundred is a lost lock. */
++static unsigned long cxdbg_smin = ~0UL, cxdbg_smax, cxdbg_ssum, cxdbg_scnt;
++static unsigned int dma_q_lpf_snapshot;
++static unsigned long cxdbg_bufdone, cxdbg_starved;
++
++static void cxdbg_field_change(struct cx231xx_dmaqueue *dma_q, int newf)
++{
++	u32 lc = dma_q->lines_completed;
++	u32 lpf = dma_q->lines_per_field;
++
++	dma_q_lpf_snapshot = lpf;
++
++	if (dma_q->current_field == 1 && newf == 2)
++		cxdbg_f12++;
++	else if (dma_q->current_field == 2 && newf == 1)
++		cxdbg_f21++;
++	else
++		cxdbg_fodd++;
++
++	/* current_field == -1 is the initial state, not a real field end */
++	if (dma_q->current_field != -1) {
++		if (lc < lpf) {
++			cxdbg_short++;
++			if (lc < cxdbg_smin)
++				cxdbg_smin = lc;
++			if (lc > cxdbg_smax)
++				cxdbg_smax = lc;
++			cxdbg_ssum += lc;
++			cxdbg_scnt++;
++		}
++		else if (lc == lpf)
++			cxdbg_exact++;
++		else
++			cxdbg_over++;
++	}
++}
++
+ static void cxdbg_report(struct cx231xx *dev)
+ {
+ 	dev_info(dev->dev,
+ 		 "cxdbg: urbs=%lu pkts=%lu err=%lu eproto=%lu empty=%lu big=%lu skip_midline=%lu\n",
+ 		 cxdbg_urbs, cxdbg_pkts, cxdbg_err, cxdbg_eproto,
+ 		 cxdbg_empty, cxdbg_big, cxdbg_skip_midline);
++	dev_info(dev->dev,
++		 "cxdbg: f1->2=%lu f2->1=%lu odd=%lu | field lines short=%lu exact=%lu over=%lu | bufdone=%lu starved=%lu\n",
++		 cxdbg_f12, cxdbg_f21, cxdbg_fodd,
++		 cxdbg_short, cxdbg_exact, cxdbg_over,
++		 cxdbg_bufdone, cxdbg_starved);
++	dev_info(dev->dev,
++		 "cxdbg: lines_per_field=%u short fields: min=%lu max=%lu avg=%lu\n",
++		 dma_q_lpf_snapshot,
++		 cxdbg_scnt ? cxdbg_smin : 0, cxdbg_smax,
++		 cxdbg_scnt ? cxdbg_ssum / cxdbg_scnt : 0);
+ }
+ 
+ /*
+@@ -473,6 +541,10 @@
+ 		bytes_parsed = 0;
+ 
+ 	}
++
++	if (++cxdbg_urbs % 250 == 0)
++		cxdbg_report(dev);
++
+ 	return 1;
+ }
+ 
+@@ -588,8 +660,11 @@
+ 	struct cx231xx_buffer *buf;
+ 	u32 _line_size = dev->width * 2;
+ 
+-	if (dma_q->current_field != field_number)
++	if (dma_q->current_field != field_number) {
++		cxdbg_field_change(dma_q, field_number);
++
+ 		cx231xx_reset_video_buffer(dev, dma_q);
++	}
+ 
+ 	/* get the buffer pointer */
+ 	if (dev->USE_ISO)
+@@ -634,6 +709,7 @@
+ 		dma_q->is_partial_line = 0;
+ 
+ 		if (cx231xx_is_buffer_done(dev, dma_q) && buf) {
++			cxdbg_bufdone++;
+ 			buffer_filled(dev, dma_q, buf);
+ 
+ 			dma_q->pos = 0;
+@@ -665,6 +741,7 @@
+ 
+ 	if (buf == NULL) {
+ 		/* first try to get the buffer */
++		cxdbg_starved++;
+ 		get_next_buf(dma_q, &buf);
+ 
+ 		dma_q->pos = 0;

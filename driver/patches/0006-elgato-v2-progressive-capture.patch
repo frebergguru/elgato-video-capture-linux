@@ -1,0 +1,112 @@
+# Incremental on 0005. RETIRED: measured worse (54.4% vs 12.8% corrupt).
+--- prev/cx231xx-video.c
++++ cx231xx/cx231xx-video.c
+@@ -302,6 +302,10 @@
+  * lines_completed and may fetch a new buffer part-way down a frame. That is
+  * what splices the picture.
+  *
++ * RETIRED -- CANNOT WORK, 2026-08-24. Suppressing the vestigial field stops
++ * current_field ever reaching 2, so cx231xx_is_buffer_done() never fires and
++ * no frames are delivered at all. Kept as a recorded negative result. Default 0.
++ *
+  * With this set to N, a field change arriving fewer than N lines after the
+  * previous one is treated as chatter and ignored: the current field keeps
+  * filling. Lines past lines_per_field are already discarded by
+@@ -313,6 +317,44 @@
+ MODULE_PARM_DESC(elgato_fielddebounce,
+ 	"Elgato V2: ignore a field change arriving fewer than N lines after the last (0 = off)");
+ 
++/*
++ * Progressive capture (Elgato V2 only, off by default).
++ *
++ * A NES/SNES emits 240p/288p: a progressive picture with no half-line field
++ * offset. The decoder has nothing to lock field detection onto, so the SAV
++ * field bit is unreliable -- measured on this box, one field per frame period
++ * carries 288 lines and the other carries an average of 4, and which label
++ * lands on the substantive one varies.
++ *
++ * The stock assembler cannot cope: cx231xx_is_buffer_done() only completes on
++ * field 2 with field1_done set, and cx231xx_do_copy() puts field 1 on even
++ * rows and field 2 on odd rows. With an unreliable label that yields buffers
++ * spliced from several moments -- ~85% of frames here.
++ *
++ * RETIRED -- MEASURED WORSE, 2026-08-24. Against a chroma-coherence metric
++ * validated on frames inspected by eye, this scored 54.4% of frames corrupt
++ * against 12.8% with it off. Keep the code as a recorded negative result: the
++ * field-assembly fault it addresses is real (the counters above prove short
++ * fields and phantom transitions) but it is a symptom, not the cause, and
++ * forcing one field into both rows costs more than it recovers. Default 0.
++ *
++ * In this mode the label is ignored entirely: a buffer is complete after
++ * lines_per_field lines whatever they were labelled, each line is written
++ * twice so the 288 real lines fill all 576 rows, and a new buffer is started
++ * when the previous one has been handed on rather than on a field change.
++ * Vertical detail is unchanged -- the source only ever had 288 lines.
++ */
++static int elgato_progressive;
++module_param(elgato_progressive, int, 0644);
++MODULE_PARM_DESC(elgato_progressive,
++	"Elgato V2: treat the source as progressive; ignore the field bit and line-double one field into each frame");
++
++static bool elg_prog(struct cx231xx *dev)
++{
++	return elgato_progressive &&
++	       dev->model == CX231XX_BOARD_ELGATO_VIDEO_CAPTURE_V2;
++}
++
+ static unsigned long cxdbg_debounced;
+ static unsigned long cxdbg_f12, cxdbg_f21, cxdbg_fodd;
+ static unsigned long cxdbg_short, cxdbg_exact, cxdbg_over;
+@@ -685,7 +727,17 @@
+ 	struct cx231xx_buffer *buf;
+ 	u32 _line_size = dev->width * 2;
+ 
+-	if (dma_q->current_field != field_number) {
++	if (elg_prog(dev)) {
++		struct cx231xx_buffer *cur = dev->USE_ISO ?
++			dev->video_mode.isoc_ctl.buf :
++			dev->video_mode.bulk_ctl.buf;
++
++		/* Start a frame only once the previous buffer has been
++		   handed on; the field bit is not trustworthy here. */
++		if (cur == NULL)
++			cx231xx_reset_video_buffer(dev, dma_q);
++		field_number = 1;
++	} else if (dma_q->current_field != field_number) {
+ 		cxdbg_field_change(dma_q, field_number);
+ 
+ 		if (elgato_fielddebounce > 0 &&
+@@ -813,6 +865,8 @@
+ 
+ 	/* Offset field 2 one line from the top of the buffer */
+ 	offset = (dma_q->current_field == 1) ? 0 : _line_size;
++	if (elg_prog(dev))
++		offset = 0;
+ 
+ 	/* Offset for field 2 */
+ 	startwrite = p_out_buffer + offset;
+@@ -832,6 +886,14 @@
+ 	/* The below copies the UYVY data straight into video buffer */
+ 	cx231xx_swab((u16 *) p_buffer, (u16 *) startwrite, (u16) lencopy);
+ 
++	/* Progressive: the source has no second field, so write each line to
++	   both rows of the pair rather than leaving the odd rows stale. */
++	if (elg_prog(dev) &&
++	    (u8 *)(startwrite + _line_size + lencopy) <=
++	    (u8 *)(p_out_buffer + dev->size))
++		cx231xx_swab((u16 *) p_buffer,
++			     (u16 *) (startwrite + _line_size), (u16) lencopy);
++
+ 	return 0;
+ }
+ 
+@@ -850,6 +912,9 @@
+ {
+ 	u8 buffer_complete = 0;
+ 
++	if (elg_prog(dev))
++		return dma_q->lines_completed >= dma_q->lines_per_field;
++
+ 	/* Dual field stream */
+ 	buffer_complete = ((dma_q->current_field == 2) &&
+ 			   (dma_q->lines_completed >= dma_q->lines_per_field) &&

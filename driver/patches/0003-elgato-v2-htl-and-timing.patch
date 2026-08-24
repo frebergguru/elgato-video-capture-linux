@@ -1,0 +1,347 @@
+--- pristine/cx231xx-avcore.c
++++ cx231xx/cx231xx-avcore.c
+@@ -16,6 +16,7 @@
+ #include <linux/module.h>
+ #include <linux/kernel.h>
+ #include <linux/bitmap.h>
++#include <linux/delay.h>
+ #include <linux/i2c.h>
+ #include <linux/mm.h>
+ #include <linux/mutex.h>
+@@ -965,6 +966,327 @@
+ EXPORT_SYMBOL_GPL(cx231xx_disable656);
+ 
+ /*
++ * ===========================================================================
++ * Elgato Video Capture V2 (USB 0fd9:0037): board-specific overrides
++ * ===========================================================================
++ *
++ * Everything below is off by default and gated on this one board, so nothing
++ * else the cx231xx driver supports can be affected.
++ *
++ * These constants are specific to this board. They are not the chip's
++ * power-on defaults and they are not in the cx25840 documentation. Rather
++ * than take any of them on trust, measure them: README.md describes a metric
++ * that reports what fraction of frames the decoder assembles correctly, and
++ * a sweep that applies each knob below and scores it.
++ *
++ * ADDRESS SPACE.  Every register here is a video-block register, reached
++ * through VID_BLK_I2C_ADDRESS (0x88, i.e. I2C address 0x44 shifted left).
++ *
++ * THE FINDING.  Two registers that neither cx231xx nor cx25840 ever writes
++ * govern the decoder's horizontal lock:
++ *
++ *	HTL_CTRL (0x498)   horizontal time lock loop constants
++ *	PLL_CTRL (0x494)   sampling PLL maximum offset
++ *
++ * A lock-acquire step forces the HTL loop constants, then polls GEN_STAT
++ * until the decoder reports video present and AGC locked before restoring
++ * them.  Under Linux both registers keep their power-on defaults and nothing
++ * ever re-acquires the lock.  That is the
++ * one mechanism left that fits the symptom this box shows (observed with a
++ * games console, but the mechanism is not specific to one kind of source):
++ * SAV to
++ * SAV line lengths that hunt between 1444 and 1636 bytes instead of holding
++ * constant, so every field is sampled at a different horizontal phase.
++ */
++
++static int elgato_htl;
++module_param(elgato_htl, int, 0644);
++MODULE_PARM_DESC(elgato_htl,
++	"Elgato V2: horizontal lock loop. 1 = set HTL_CTRL/PLL_CTRL constants, 2 = also run the lock-acquire routine");
++
++static int elgato_vdrst;
++module_param(elgato_vdrst, int, 0644);
++MODULE_PARM_DESC(elgato_vdrst,
++	"Elgato V2: pulse AFE_DIAG_CTRL3[0] and VD_SOFT_RST during decoder init");
++
++static int elgato_timing;
++module_param(elgato_timing, int, 0644);
++MODULE_PARM_DESC(elgato_timing,
++	"Elgato V2: board-specific per-standard vertical timing");
++
++static int elgato_modectrl;
++module_param(elgato_modectrl, int, 0644);
++MODULE_PARM_DESC(elgato_modectrl,
++	"Elgato V2: MODE_CTRL subcarrier-lock and ACFG_DIS bits");
++
++static int elgato_comb = -1;
++module_param(elgato_comb, int, 0644);
++MODULE_PARM_DESC(elgato_comb,
++	"Elgato V2: SRC_COMB_CFG comb-filter bits (-1 = leave alone)");
++
++static int elgato_lpf = -1;
++module_param(elgato_lpf, int, 0644);
++MODULE_PARM_DESC(elgato_lpf,
++	"Elgato V2: SRC_COMB_CFG luma/UV low-pass filter select, 0-3 (-1 = leave alone)");
++
++static int elgato_regs;
++module_param(elgato_regs, int, 0644);
++MODULE_PARM_DESC(elgato_regs,
++	"Elgato V2: dump the decoder timing and lock registers to the kernel log after each standard change");
++
++static bool cx231xx_is_elgato_v2(struct cx231xx *dev)
++{
++	return dev->model == CX231XX_BOARD_ELGATO_VIDEO_CAPTURE_V2;
++}
++
++/*
++ * HTL/PLL constants.
++ *
++ * HTL_CTRL[19:0] is forced to 0x00802:
++ *	HTL_KD		= 0x08
++ *	HTL_KI		= 0x02
++ *	AUTO_LOCK_SPD	= 0	the loop does not retune its own bandwidth
++ *	MAN_FAST_LOCK	= 0
++ *	HTL_15K_EN	= 0
++ *	HTL_500K_EN	= 0
++ *
++ * PLL_CTRL keeps whatever PLL_KD/PLL_KI the chip came up with and sets
++ * PLL_MAX_OFFSET to 0x1000, which bounds how far the sampling clock may be
++ * dragged per line.  An unbounded offset is exactly what a hunting line
++ * length looks like.
++ */
++static void cx231xx_elgato_v2_htl(struct cx231xx *dev)
++{
++	u32 value = 0;
++
++	if (vid_blk_read_word(dev, HTL_CTRL, &value) >= 0) {
++		value = (value & 0xfff00802) | 0x802;
++		vid_blk_write_word(dev, HTL_CTRL, value);
++	}
++
++	if (vid_blk_read_word(dev, PLL_CTRL, &value) >= 0) {
++		value = (value & 0xffff1000) | 0x1000;
++		vid_blk_write_word(dev, PLL_CTRL, value);
++	}
++}
++
++/*
++ * The lock-acquire routine.
++ *
++ * Force the HTL constants, wait 25ms, then poll GEN_STAT up to three times
++ * 5ms apart for VPRES and AGC_LOCK.  On success the previous HTL_CTRL value
++ * is put back; if the decoder never reports a lock the forced constants are
++ * left in place.
++ *
++ * This is gated on one particular input selection upstream; here it runs
++ * whenever it is asked to, since this board only ever has composite and
++ * S-Video wired up.
++ */
++static void cx231xx_elgato_v2_acquire_lock(struct cx231xx *dev)
++{
++	u32 saved = 0, status = 0;
++	int i;
++
++	if (vid_blk_read_word(dev, HTL_CTRL, &saved) < 0)
++		return;
++	if ((saved & 0xffff) == 0x802)
++		return;
++
++	vid_blk_write_word(dev, HTL_CTRL, (saved & 0xffff0802) | 0x802);
++	msleep(25);
++
++	for (i = 0; i < 3; i++) {
++		if (vid_blk_read_word(dev, GEN_STAT, &status) >= 0 &&
++		    (status & FLD_VPRES) && (status & FLD_AGC_LOCK)) {
++			vid_blk_write_word(dev, HTL_CTRL, saved);
++			dev_dbg(dev->dev,
++				"elgato: lock acquired after %d poll(s), HTL_CTRL restored to 0x%08x\n",
++				i, saved);
++			return;
++		}
++		msleep(5);
++	}
++
++	dev_dbg(dev->dev,
++		"elgato: no lock after 3 polls, leaving HTL_CTRL forced\n");
++}
++
++/*
++ * Opening sequence: an undocumented AFE_DIAG_CTRL3 bit 0 pulse followed by a
++ * video-decoder soft reset.  Neither cx231xx nor cx25840 resets the decoder
++ * block; this board wants it every time the decoder is set up.
++ */
++static void cx231xx_elgato_v2_vd_reset(struct cx231xx *dev)
++{
++	u32 value = 0;
++
++	if (vid_blk_read_word(dev, AFE_DIAG_CTRL3, &value) >= 0) {
++		vid_blk_write_word(dev, AFE_DIAG_CTRL3, value | 1);
++		vid_blk_write_word(dev, AFE_DIAG_CTRL3, value & ~1u);
++	}
++
++	vid_blk_write_word(dev, SOFT_RST_CTRL, FLD_VD_SOFT_RST);
++	vid_blk_write_word(dev, SOFT_RST_CTRL, 0);
++}
++
++/*
++ * Per-standard vertical timing.  Only the values that differ from the stock
++ * ones above are applied:
++ *
++ *		    stock	this board
++ *   NTSC VACTIVE   0x1e7 (487)	0x1e6 (486)
++ *   NTSC V656BLANK 0x1c  (28)	0x1e  (30)
++ *   PAL  VBLANK    0x20  (32)	0x24  (36)
++ *
++ * For PAL only VBLANK and HBLANK are written, leaving VACTIVE and V656BLANK
++ * at whatever cx25840_std_setup() computed, which is where the stock
++ * driver's 0x244/0x24 pair comes from anyway.
++ */
++static void cx231xx_elgato_v2_timing(struct cx231xx *dev)
++{
++	if (dev->norm & (V4L2_STD_NTSC | V4L2_STD_PAL_M)) {
++		cx231xx_read_modify_write_i2c_dword(dev, VID_BLK_I2C_ADDRESS,
++						    VERT_TIM_CTRL,
++						    FLD_VACTIVE_CNT,
++						    0x1E6000);
++		cx231xx_read_modify_write_i2c_dword(dev, VID_BLK_I2C_ADDRESS,
++						    VERT_TIM_CTRL,
++						    FLD_V656BLANK_CNT,
++						    0x1E000000);
++	} else {
++		cx231xx_read_modify_write_i2c_dword(dev, VID_BLK_I2C_ADDRESS,
++						    VERT_TIM_CTRL,
++						    FLD_VBLANK_CNT, 0x24);
++	}
++}
++
++/*
++ * MODE_CTRL bits, per standard.  AUTO_SC_LOCK and MAN_SC_FAST_LOCK are
++ * cleared and CKILLEN set for both.  The NTSC path leaves the two
++ * subcarrier-lock bits off; the PAL path turns them back on together with
++ * FAST_LOCK_MD.  ACFG_DIS is set in both, which is what stops the chip
++ * re-deriving these from autodetect.
++ */
++static void cx231xx_elgato_v2_modectrl(struct cx231xx *dev)
++{
++	u32 value = 0;
++
++	if (vid_blk_read_word(dev, MODE_CTRL, &value) < 0)
++		return;
++
++	value &= ~(FLD_AUTO_SC_LOCK | FLD_MAN_SC_FAST_LOCK | FLD_FAST_LOCK_MD);
++	if (!(dev->norm & (V4L2_STD_NTSC | V4L2_STD_PAL_M)))
++		value |= FLD_AUTO_SC_LOCK | FLD_MAN_SC_FAST_LOCK |
++			 FLD_FAST_LOCK_MD;
++	value |= FLD_ACFG_DIS | FLD_CKILLEN;
++
++	vid_blk_write_word(dev, MODE_CTRL, value);
++}
++
++/*
++ * SRC_COMB_CFG comb-filter bits.  Clears CCOMB_2LN_CHECK for NTSC, and both
++ * CCOMB_2LN_CHECK and CCOMB_3LN_EN for PAL.  Pass any other value to write
++ * the whole register instead, which is how a candidate is tried.
++ */
++static void cx231xx_elgato_v2_comb(struct cx231xx *dev)
++{
++	u32 value = 0;
++
++	if (elgato_comb == 1) {
++		if (vid_blk_read_word(dev, SRC_COMB_CFG, &value) < 0)
++			return;
++		value &= ~FLD_CCOMB_2LN_CHECK;
++		if (!(dev->norm & (V4L2_STD_NTSC | V4L2_STD_PAL_M)))
++			value &= ~FLD_CCOMB_3LN_EN;
++		vid_blk_write_word(dev, SRC_COMB_CFG, value);
++	} else {
++		vid_blk_write_word(dev, SRC_COMB_CFG, (u32)elgato_comb);
++	}
++}
++
++/* SRC_COMB_CFG luma and chroma low-pass filter select, 0-3. */
++static void cx231xx_elgato_v2_lpf(struct cx231xx *dev)
++{
++	u32 sel = (u32)elgato_lpf & 3;
++
++	cx231xx_read_modify_write_i2c_dword(dev, VID_BLK_I2C_ADDRESS,
++					    SRC_COMB_CFG, FLD_LUMA_LPF_SEL,
++					    cx231xx_set_field(FLD_LUMA_LPF_SEL,
++							      sel));
++	cx231xx_read_modify_write_i2c_dword(dev, VID_BLK_I2C_ADDRESS,
++					    SRC_COMB_CFG, FLD_UV_LPF_SEL,
++					    cx231xx_set_field(FLD_UV_LPF_SEL,
++							      sel));
++}
++
++/*
++ * Read the decoder back.  Earlier claims about these registers turned out to
++ * be wrong because they were inferred rather than measured, so anything
++ * asserted about them should be checked here first.
++ */
++static void cx231xx_elgato_v2_dump(struct cx231xx *dev)
++{
++	static const struct {
++		u16 reg;
++		const char *name;
++	} regs[] = {
++		{ MODE_CTRL,	  "MODE_CTRL     " },
++		{ OUT_CTRL1,	  "OUT_CTRL1    " },
++		{ GEN_STAT,	  "GEN_STAT     " },
++		{ HORIZ_TIM_CTRL, "HORIZ_TIM_CTRL" },
++		{ VERT_TIM_CTRL,  "VERT_TIM_CTRL " },
++		{ SRC_COMB_CFG,	  "SRC_COMB_CFG " },
++		{ CHROMA_VBIOFF_CFG, "CHROMA_VBIOFF" },
++		{ DFE_CTRL1,	  "DFE_CTRL1    " },
++		{ DFE_CTRL3,	  "DFE_CTRL3    " },
++		{ PLL_CTRL,	  "PLL_CTRL     " },
++		{ HTL_CTRL,	  "HTL_CTRL     " },
++		{ COMB_CTRL,	  "COMB_CTRL    " },
++	};
++	unsigned int i;
++	u32 value;
++
++	for (i = 0; i < ARRAY_SIZE(regs); i++) {
++		value = 0;
++		if (vid_blk_read_word(dev, regs[i].reg, &value) >= 0)
++			dev_info(dev->dev, "elgato: %s (0x%03x) = 0x%08x\n",
++				 regs[i].name, regs[i].reg, value);
++		else
++			dev_info(dev->dev, "elgato: %s (0x%03x) = <read failed>\n",
++				 regs[i].name, regs[i].reg);
++	}
++}
++
++/*
++ * Applied at the tail of cx231xx_do_mode_ctrl_overrides(), after the
++ * per-standard setter, which is where it has to go: this driver calls
++ * do_mode_ctrl_overrides() from both vidioc_s_std() and the set_fmt path, so
++ * the overrides also survive the geometry recompute that set_fmt performs.
++ */
++static void cx231xx_elgato_v2_overrides(struct cx231xx *dev)
++{
++	if (!cx231xx_is_elgato_v2(dev))
++		return;
++
++	if (elgato_vdrst)
++		cx231xx_elgato_v2_vd_reset(dev);
++	if (elgato_timing)
++		cx231xx_elgato_v2_timing(dev);
++	if (elgato_modectrl)
++		cx231xx_elgato_v2_modectrl(dev);
++	if (elgato_comb != -1)
++		cx231xx_elgato_v2_comb(dev);
++	if (elgato_lpf != -1)
++		cx231xx_elgato_v2_lpf(dev);
++	if (elgato_htl)
++		cx231xx_elgato_v2_htl(dev);
++	if (elgato_htl > 1)
++		cx231xx_elgato_v2_acquire_lock(dev);
++	if (elgato_regs)
++		cx231xx_elgato_v2_dump(dev);
++}
++
++/*
+  * Handle any video-mode specific overrides that are different
+  * on a per video standards basis after touching the MODE_CTRL
+  * register which resets many values for autodetect
+@@ -1063,6 +1385,8 @@
+ 
+ 	}
+ 
++	cx231xx_elgato_v2_overrides(dev);
++
+ 	return status;
+ }
+ 

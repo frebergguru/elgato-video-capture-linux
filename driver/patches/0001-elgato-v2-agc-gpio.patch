@@ -1,0 +1,12 @@
+--- pristine/cx231xx-cards.c
++++ cx231xx/cx231xx-cards.c
+@@ -635,7 +635,8 @@
+ 		.output_mode = OUT_MODE_VIP11,
+ 		.demod_xfer_mode = 0,
+ 		.ctl_pin_status_mask = 0xFFFFFFC4,
+-		.agc_analog_digital_select_gpio = 0x0c,
++		.agc_analog_digital_select_gpio = 0x1c,	/* not 0x0c: this board
++						 * selects the analogue AGC path on a different GPIO bit */
+ 		.gpio_pin_status_mask = 0x4001000,
+ 		.norm = V4L2_STD_NTSC,
+ 		.no_alt_vanc = 1,

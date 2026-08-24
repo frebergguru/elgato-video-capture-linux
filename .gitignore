@@ -1,0 +1,19 @@
+# Kernel module build artefacts
+*.o
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+*.symvers
+*.order
+.*.cmd
+.tmp_versions/
+modules.order
+Module.symvers
+*.rej
+*.orig
+
+# Editor / OS noise
+*~
+*.swp
+.DS_Store

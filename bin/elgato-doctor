@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Hypnotize
+# Diagnose the Elgato Video Capture end to end.
+#
+# Worth running first whenever something misbehaves. This box is prone to
+# wedging its USB link (-EPROTO on control transfers), after which nothing
+# streams until it is reset -- and the symptoms otherwise look like a driver
+# problem, which it is not.
+
+set -uo pipefail
+
+# readlink -f first: these are symlinked into ~/.local/bin, and without it
+# dirname resolves to the symlink's directory, not the repo.
+SELF_DIR=$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd)
+# shellcheck source=../lib/elgato-common.sh
+source "$SELF_DIR/../lib/elgato-common.sh"
+
+PASS=0; FAIL=0; WARNED=0
+ok()   { printf '  \033[1;32m[ok]\033[0m   %s\n' "$*"; PASS=$((PASS+1)); }
+bad()  { printf '  \033[1;31m[FAIL]\033[0m %s\n' "$*"; FAIL=$((FAIL+1)); }
+note() { printf '  \033[1;33m[warn]\033[0m %s\n' "$*"; WARNED=$((WARNED+1)); }
+info() { printf '         %s\n' "$*"; }
+
+echo
+echo "Elgato Video Capture diagnostics"
+echo "================================"
+
+echo
+echo "USB"
+USB_LINE=$(lsusb 2>/dev/null | grep -i "$ELGATO_USB_ID")
+if [[ -n $USB_LINE ]]; then
+    ok "device present"
+    info "$USB_LINE"
+    USB_PATH=$(readlink -f "/sys/bus/usb/devices/1-2" 2>/dev/null)
+    for d in /sys/bus/usb/devices/*; do
+        [[ -r $d/idVendor && -r $d/idProduct ]] || continue
+        if [[ $(<"$d/idVendor") == 0fd9 && $(<"$d/idProduct") == 0037 ]]; then
+            USB_PATH=$d
+            info "sysfs: $d  speed=$(<"$d/speed")Mbps  power/control=$(<"$d/power/control")"
+            [[ $(<"$d/power/control") == on ]] \
+                || note "USB autosuspend is enabled; install the udev rule to pin it 'on'"
+        fi
+    done
+else
+    bad "device not plugged in (expected $ELGATO_USB_ID)"
+fi
+
+echo
+echo "Kernel driver"
+if lsmod | grep '^cx231xx ' >/dev/null; then
+    ok "cx231xx loaded"
+    lsmod | grep '^cx231xx_alsa' >/dev/null && ok "cx231xx_alsa loaded" || bad "cx231xx_alsa NOT loaded"
+else
+    bad "cx231xx not loaded"
+fi
+if journalctl -k -b 2>/dev/null | grep "loaded v4l-cx231xx-avcore-01.fw" >/dev/null; then
+    ok "cx25840 decoder firmware loaded"
+else
+    note "no firmware-load message in this boot's log"
+fi
+
+echo
+echo "USB link health"
+EPROTO=$(usb_errors_since_plug)
+if (( EPROTO == 0 )); then
+    ok "no -EPROTO errors since the device last enumerated"
+else
+    bad "$EPROTO USB -EPROTO errors since the last replug - the link is wedged"
+    info "Symptom: STREAMON fails, 'cannot change alt number', 'picture size (0 x 0)'."
+    info "Fix: unplug and replug the box (a direct USB-A port, not a hub), or:"
+    info "    sudo usbreset $ELGATO_USB_ID"
+    journalctl -k -b 2>/dev/null | grep -E 'cx231xx.*-71' | tail -2 | sed 's/^/         /'
+fi
+
+echo
+echo "Video device"
+if DEV=$(find_device); then
+    ok "found at $DEV"
+    [[ -c /dev/elgato ]] && ok "/dev/elgato symlink present" \
+                         || note "/dev/elgato missing - run install.sh for the udev rule"
+    [[ -r $DEV && -w $DEV ]] && ok "readable and writable by $USER" \
+                             || bad "no read/write permission on $DEV"
+    info "card:  $(v4l2-ctl -d "$DEV" --info 2>/dev/null | sed -n 's/\s*Card type\s*: //p')"
+    info "input: $(input_status "$DEV")  (this status bit is unreliable - see lib/)"
+else
+    bad "no V4L2 node for the capture device"
+fi
+
+echo
+echo "Capture"
+if [[ -n ${DEV:-} ]]; then
+    # Test the composite input explicitly rather than whatever happens to be
+    # selected -- a previous run or manual poking may have left it on S-Video.
+    DOCTOR_INPUT=${DOCTOR_INPUT:-0}
+    v4l2-ctl -d "$DEV" -i "$DOCTOR_INPUT" >/dev/null 2>&1
+    settle
+    info "testing input $DOCTOR_INPUT ($(v4l2-ctl -d "$DEV" --get-input 2>/dev/null | sed -n 's/.*(\(.*\):.*/\1/p'))"
+    if delivers_frames "$DEV" 20 5; then
+        ok "captured 20 frames successfully"
+        # Frames alone prove nothing: on an unconnected input the decoder
+        # free-runs and emits rolling noise at the nominal rate.
+        if has_signal "$DEV"; then
+            ok "frames contain a real picture"
+        else
+            bad "frames contain no picture - the source is not sending video"
+            info "The capture chain itself is fine - frames are flowing, they"
+            info "just carry no picture. Check the yellow RCA is seated at both"
+            info "ends, and that the source is powered on and playing."
+            info "If audio below is present but this fails, the fault is"
+            info "specifically the yellow video lead."
+        fi
+    else
+        bad "could not capture frames"
+        info "If the USB link check above failed, fix that first."
+        info "Otherwise check the source is powered on and the standard is right:"
+        info "    elgato-viewer --ntsc   or   elgato-viewer --pal"
+    fi
+fi
+
+echo
+echo "Audio"
+if grep Cx231xxAudio /proc/asound/cards >/dev/null 2>&1; then
+    ok "ALSA card present ($(sed -n 's/^ *\([0-9]\+\) \[Cx231xxAudio.*/card \1/p' /proc/asound/cards))"
+else
+    bad "no Cx231xxAudio ALSA card"
+fi
+NODE=$(find_audio_node)
+if [[ -n $NODE ]]; then
+    ok "PipeWire node present"
+    info "$NODE"
+else
+    bad "no PipeWire node for the capture audio"
+fi
+DEFAULT_SRC=$(wpctl status 2>/dev/null | sed -n '/Sources:/,/^ *[├└]/p' | grep '\*' | head -1)
+if [[ $DEFAULT_SRC == *"Elgato"* || $DEFAULT_SRC == *"Video Capture"* ]]; then
+    bad "the capture card is your DEFAULT MICROPHONE - voice chat will send capture audio"
+    info "Fix: install the WirePlumber rule (install.sh), then re-pin your mic:"
+    info "    wpctl set-default <your-mic-id>"
+else
+    ok "default microphone is not the capture card"
+fi
+LEVEL=$(audio_level)
+if [[ -n $LEVEL ]]; then
+    if (( $(echo "$LEVEL > -70" | bc -l 2>/dev/null || echo 0) )); then
+        ok "audio signal present (${LEVEL} dBFS)"
+    else
+        note "audio input is silent (${LEVEL} dBFS) - source muted or not connected"
+    fi
+else
+    note "could not measure the audio level"
+fi
+"$SELF_DIR/elgato-audio" status >/dev/null 2>&1 \
+    && info "audio loopback: running" || info "audio loopback: stopped"
+
+echo
+echo "--------------------------------"
+printf 'passed %d, warnings %d, failed %d\n' "$PASS" "$WARNED" "$FAIL"
+echo
+(( FAIL == 0 ))

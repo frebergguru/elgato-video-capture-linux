@@ -1,0 +1,17 @@
+# Elgato Video Capture (USB 0fd9:0037, Conexant cx231xx)
+#
+# 1. Stable /dev/elgato symlink.
+#    KERNEL=="video[0-9]*" is required: this driver also registers vbi0 under
+#    the video4linux subsystem, which would otherwise match too.
+#    Matching vendor/product rather than the serial means a replacement unit
+#    still works.
+SUBSYSTEM=="video4linux", KERNEL=="video[0-9]*", \
+  ATTRS{idVendor}=="0fd9", ATTRS{idProduct}=="0037", \
+  SYMLINK+="elgato", TAG+="uaccess"
+
+# 2. Disable USB autosuspend for this device.
+#    The global autosuspend delay is 2s. This box is bus-powered at the full
+#    500mA and has been observed returning -EPROTO on control transfers and
+#    interface-alt changes; letting it suspend between uses makes that worse.
+ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="0fd9", ATTR{idProduct}=="0037", \
+  TEST=="power/control", ATTR{power/control}="on"

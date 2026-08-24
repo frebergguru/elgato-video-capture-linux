@@ -1,0 +1,78 @@
+--- pristine/cx231xx-video.c	2026-08-23 18:08:27.046185273 +0200
++++ cx231xx/cx231xx-video.c	2026-08-23 18:08:27.054584130 +0200
+@@ -257,6 +257,29 @@
+ }
+ 
+ /*
++ * Instrumentation (out-of-tree debug build).
++ *
++ * Testing the Elgato Video Capture V2 showed frames whose rows are internally
++ * sharp but shifted horizontally relative to each other. The suspicion is that
++ * when a packet is skipped here, dma_q->is_partial_line and dma_q->partial_buf
++ * keep state from the previous packet, so the line assembler splices across the
++ * gap without accounting for the missing bytes.
++ *
++ * cxdbg_skip_midline is the counter that tests that theory directly: it counts
++ * packets dropped while a partial line was still open.
++ */
++static unsigned long cxdbg_urbs, cxdbg_pkts, cxdbg_err, cxdbg_eproto;
++static unsigned long cxdbg_empty, cxdbg_big, cxdbg_skip_midline;
++
++static void cxdbg_report(struct cx231xx *dev)
++{
++	dev_info(dev->dev,
++		 "cxdbg: urbs=%lu pkts=%lu err=%lu eproto=%lu empty=%lu big=%lu skip_midline=%lu\n",
++		 cxdbg_urbs, cxdbg_pkts, cxdbg_err, cxdbg_eproto,
++		 cxdbg_empty, cxdbg_big, cxdbg_skip_midline);
++}
++
++/*
+  * Controls the isoc copy of each urb packet
+  */
+ static inline int cx231xx_isoc_copy(struct cx231xx *dev, struct urb *urb)
+@@ -282,19 +305,33 @@
+ 	for (i = 0; i < urb->number_of_packets; i++) {
+ 		int status = urb->iso_frame_desc[i].status;
+ 
++		cxdbg_pkts++;
++
+ 		if (status < 0) {
++			cxdbg_err++;
++			if (urb->iso_frame_desc[i].status == -EPROTO)
++				cxdbg_eproto++;
+ 			print_err_status(dev, i, status);
+-			if (urb->iso_frame_desc[i].status != -EPROTO)
++			if (urb->iso_frame_desc[i].status != -EPROTO) {
++				if (dma_q->is_partial_line)
++					cxdbg_skip_midline++;
+ 				continue;
++			}
+ 		}
+ 
+ 		if (urb->iso_frame_desc[i].actual_length <= 0) {
+ 			/* cx231xx_isocdbg("packet %d is empty",i); - spammy */
++			cxdbg_empty++;
++			if (dma_q->is_partial_line)
++				cxdbg_skip_midline++;
+ 			continue;
+ 		}
+ 		if (urb->iso_frame_desc[i].actual_length >
+ 		    dev->video_mode.max_pkt_size) {
+ 			cx231xx_isocdbg("packet bigger than packet size");
++			cxdbg_big++;
++			if (dma_q->is_partial_line)
++				cxdbg_skip_midline++;
+ 			continue;
+ 		}
+ 
+@@ -353,6 +390,10 @@
+ 		bytes_parsed = 0;
+ 
+ 	}
++
++	if (++cxdbg_urbs % 250 == 0)
++		cxdbg_report(dev);
++
+ 	return 1;
+ }
+ 

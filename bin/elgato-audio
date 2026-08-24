@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Hypnotize
+# Route Elgato Video Capture audio to the speakers with low latency.
+#
+# Uses pw-loopback rather than pulling audio into the video pipeline, because:
+#  * only one client may open the raw ALSA device hw:3,0, so going through
+#    PipeWire lets the GStreamer script, OBS and VLC all coexist;
+#  * PipeWire adaptively resamples between the USB capture clock and the
+#    speaker clock, which is what stops drift and crackle over a long session.
+
+set -uo pipefail
+
+# readlink -f first: these are symlinked into ~/.local/bin, and without it
+# dirname resolves to the symlink's directory, not the repo.
+SELF_DIR=$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd)
+# shellcheck source=../lib/elgato-common.sh
+source "$SELF_DIR/../lib/elgato-common.sh"
+
+RUN_DIR="${XDG_RUNTIME_DIR:-/tmp}/elgato"
+PID_FILE="$RUN_DIR/loopback.pid"
+LATENCY_MS=${ELGATO_AUDIO_LATENCY_MS:-15}
+
+is_running() {
+    [[ -r $PID_FILE ]] || return 1
+    local pid; pid=$(<"$PID_FILE")
+    [[ -n $pid ]] && kill -0 "$pid" 2>/dev/null
+}
+
+start() {
+    # A stale loopback whose pid file was overwritten would otherwise survive
+    # and stack with the new one.
+    local strays
+    # pgrep -c prints the count AND exits non-zero when the count is zero, so
+    # "|| echo 0" would append a second line and break the arithmetic test.
+    strays=$(pgrep -xc pw-loopback 2>/dev/null)
+    [[ -z $strays ]] && strays=0
+    if is_running && [[ ${strays:-0} -le 1 ]]; then
+        msg "Audio loopback already running (pid $(<"$PID_FILE"))."
+        return 0
+    fi
+    if [[ ${strays:-0} -gt 0 ]]; then
+        warn "Clearing ${strays} stray audio loopback(s)"
+        kill_strays >/dev/null
+        sleep 0.3
+    fi
+
+    local node
+    node=$(find_audio_node)
+    if [[ -z $node ]]; then
+        warn "No usable Elgato audio source in PipeWire."
+        if grep Cx231xxAudio /proc/asound/cards >/dev/null 2>&1; then
+            warn "The ALSA card exists but PipeWire has no Source node for it,"
+            warn "which usually means the USB link is wedged. Run: elgato-doctor"
+        else
+            warn "The ALSA card is missing entirely. Is the device plugged in?"
+        fi
+        return 1
+    fi
+
+    mkdir -p "$RUN_DIR"
+    msg "Audio: $node -> default sink (${LATENCY_MS}ms)"
+
+    pw-loopback \
+        --latency "${LATENCY_MS}ms" \
+        --capture "$node" \
+        --capture-props='node.name=elgato-audio-in node.description="Elgato capture in"' \
+        --playback-props='node.name=elgato-audio-out node.description="Elgato capture out"' \
+        >"$RUN_DIR/loopback.log" 2>&1 &
+
+    local pid=$!
+    echo "$pid" > "$PID_FILE"
+
+    # pw-loopback exits immediately if the target node is bad; catch that here
+    # rather than leaving a stale pid file and silent no-audio.
+    sleep 0.4
+    if ! kill -0 "$pid" 2>/dev/null; then
+        rm -f "$PID_FILE"
+        warn "Audio loopback failed to start:"
+        sed 's/^/    /' "$RUN_DIR/loopback.log" >&2
+        return 1
+    fi
+
+    # Verify what actually got connected. If pw-loopback cannot reach the
+    # requested node it falls back to the default source -- which silently
+    # loops your laptop microphone to the speakers instead of the capture source.
+    # Never leave that running.
+    sleep 0.6
+    local feeding
+    feeding=$(what_feeds elgato-audio-in)
+    if [[ -z $feeding ]]; then
+        warn "Audio loopback started but nothing is connected to it."
+        stop
+        return 1
+    fi
+    if [[ $feeding != *"$ELGATO_AUDIO_PATTERN"* ]]; then
+        warn "Audio loopback attached to the WRONG source:"
+        warn "    $feeding"
+        warn "Expected the Elgato capture node. Stopping to avoid looping your mic."
+        stop
+        return 1
+    fi
+    return 0
+}
+
+# Kill every loopback of ours, not just the one in the pid file.
+#
+# Orphans accumulate whenever the caller dies without running its cleanup, and
+# the pid file only ever tracks the most recent one. Several loopbacks feeding
+# the same sink from the same source play the same audio at slightly different
+# offsets, which comb-filters into exactly the "garbage audio" symptom.
+kill_strays() {
+    local pids
+    pids=$(pgrep -x pw-loopback 2>/dev/null)
+    [[ -z $pids ]] && return 0
+    local n; n=$(wc -w <<< "$pids")
+    [[ -z $n ]] && n=0
+    (( n > 0 )) && kill $pids 2>/dev/null
+    echo "$n"
+}
+
+stop() {
+    local killed
+    killed=$(kill_strays)
+    rm -f "$PID_FILE"
+    if [[ -n ${killed:-} && ${killed:-0} -gt 0 ]]; then
+        msg "Audio loopback stopped (${killed} process(es))."
+    fi
+}
+
+case "${1:-start}" in
+    start)   start ;;
+    stop)    stop ;;
+    restart) stop; start ;;
+    status)
+        if is_running; then
+            echo "running (pid $(<"$PID_FILE"))"
+        else
+            echo "stopped"; exit 1
+        fi
+        ;;
+    *) die "usage: ${0##*/} {start|stop|restart|status}" ;;
+esac

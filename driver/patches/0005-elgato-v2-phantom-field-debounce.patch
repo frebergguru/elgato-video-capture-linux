@@ -1,0 +1,67 @@
+# Incremental on 0004. RETIRED: cannot work -- see the comment in the hunk.
+--- prev/cx231xx-video.c
++++ cx231xx/cx231xx-video.c
+@@ -290,6 +290,30 @@
+  *   short/exact/over  lines actually delivered in the field that just ended,
+  *                  against lines_per_field
+  */
++/*
++ * Phantom-field debounce (Elgato V2 only, off by default).
++ *
++ * Measured on a NES: fields alternate 1,2,1,2 cleanly, but half of them carry
++ * an average of 4 lines out of 288 (min 0, max 237). Those are not truncated
++ * fields, they are spurious field-bit toggles -- a progressive 240p/288p
++ * console has no half-line offset, so the decoder's field detection chatters.
++ *
++ * Every chatter calls cx231xx_reset_video_buffer(), which zeroes
++ * lines_completed and may fetch a new buffer part-way down a frame. That is
++ * what splices the picture.
++ *
++ * With this set to N, a field change arriving fewer than N lines after the
++ * previous one is treated as chatter and ignored: the current field keeps
++ * filling. Lines past lines_per_field are already discarded by
++ * cx231xx_copy_video_line(), so the phantom's handful of lines are dropped
++ * safely rather than corrupting the buffer.
++ */
++static int elgato_fielddebounce;
++module_param(elgato_fielddebounce, int, 0644);
++MODULE_PARM_DESC(elgato_fielddebounce,
++	"Elgato V2: ignore a field change arriving fewer than N lines after the last (0 = off)");
++
++static unsigned long cxdbg_debounced;
+ static unsigned long cxdbg_f12, cxdbg_f21, cxdbg_fodd;
+ static unsigned long cxdbg_short, cxdbg_exact, cxdbg_over;
+ /* How short is short? One line is a timing tweak; a hundred is a lost lock. */
+@@ -341,10 +365,11 @@
+ 		 cxdbg_short, cxdbg_exact, cxdbg_over,
+ 		 cxdbg_bufdone, cxdbg_starved);
+ 	dev_info(dev->dev,
+-		 "cxdbg: lines_per_field=%u short fields: min=%lu max=%lu avg=%lu\n",
++		 "cxdbg: lines_per_field=%u short fields: min=%lu max=%lu avg=%lu debounced=%lu\n",
+ 		 dma_q_lpf_snapshot,
+ 		 cxdbg_scnt ? cxdbg_smin : 0, cxdbg_smax,
+-		 cxdbg_scnt ? cxdbg_ssum / cxdbg_scnt : 0);
++		 cxdbg_scnt ? cxdbg_ssum / cxdbg_scnt : 0,
++		 cxdbg_debounced);
+ }
+ 
+ /*
+@@ -663,7 +688,17 @@
+ 	if (dma_q->current_field != field_number) {
+ 		cxdbg_field_change(dma_q, field_number);
+ 
+-		cx231xx_reset_video_buffer(dev, dma_q);
++		if (elgato_fielddebounce > 0 &&
++		    dev->model == CX231XX_BOARD_ELGATO_VIDEO_CAPTURE_V2 &&
++		    dma_q->current_field != -1 &&
++		    dma_q->lines_completed < (u32)elgato_fielddebounce) {
++			/* Chatter, not a real field boundary. Keep filling the
++			   field we are already in; do not reset the buffer. */
++			cxdbg_debounced++;
++			field_number = dma_q->current_field;
++		} else {
++			cx231xx_reset_video_buffer(dev, dma_q);
++		}
+ 	}
+ 
+ 	/* get the buffer pointer */

@@ -1,0 +1,705 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Hypnotize
+# elgato-viewer -- watch the Elgato Video Capture live, with low enough
+#                  latency to play games on.
+#
+# Design notes, because the non-obvious choices here are the whole point:
+#
+#  * Video and audio travel on SEPARATE paths. Video goes V4L2 -> GStreamer ->
+#    screen; audio goes ALSA -> PipeWire -> speakers via bin/elgato-audio. Pulling
+#    the audio into the GStreamer pipeline instead would force the video to wait
+#    on an audio clock that is derived from a different crystal to the USB
+#    capture clock, and the two drift. On a long session that shows up as
+#    periodic stalls or a slowly growing lip-sync error. Kept apart, each side
+#    free-runs at its own rate and PipeWire adaptively resamples the audio.
+#
+#  * The video sink runs sync=false, i.e. a frame is drawn the moment it lands
+#    rather than being held back until its timestamp is due. That removes a
+#    frame-and-a-bit of buffering latency, which is the difference between
+#    playable and not. Nothing is lost by it: the capture card is already the
+#    clock, so there is no second timeline to sync to.
+#
+#  * The queue in front of the sink is short and leaky=downstream. If the
+#    compositor ever stalls, old frames are dropped instead of accumulating --
+#    latency stays flat and you see a dropped frame rather than a growing delay.
+#
+#  * Deinterlacing defaults to 'linear', a single-field method with no temporal
+#    lookahead. The motion-adaptive methods look better on video but need future
+#    fields, which costs latency you can feel on a controller.
+#
+# This script is deliberately self-contained: it shells out to elgato-audio,
+# elgato-reset and elgato-doctor, but shares no library with them.
+
+set -uo pipefail
+
+SELF_DIR=$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd)
+
+USB_ID="0fd9:0037"
+CARD_NAME="Elgato Video Capture"
+
+# ---------------------------------------------------------------- output ----
+if [[ -t 2 ]]; then
+    C_RED=$'\033[1;31m'; C_YEL=$'\033[1;33m'; C_GRN=$'\033[1;32m'; C_OFF=$'\033[0m'
+else
+    C_RED=''; C_YEL=''; C_GRN=''; C_OFF=''
+fi
+msg()  { printf '%s>>%s %s\n' "$C_GRN" "$C_OFF" "$*" >&2; }
+warn() { printf '%s!!%s %s\n' "$C_YEL" "$C_OFF" "$*" >&2; }
+err()  { printf '%sxx%s %s\n' "$C_RED" "$C_OFF" "$*" >&2; }
+die()  { err "$*"; exit 1; }
+
+# ----------------------------------------------------------------- usage ----
+usage() {
+    cat <<EOF
+usage: ${0##*/} [options]
+
+Play the Elgato Video Capture full-screen-able, low latency, with sound.
+
+  -i, --input WHICH     composite (default) | svideo | 0 | 1
+      --pal             force the PAL standard
+      --ntsc            force the NTSC standard
+                        (default: leave whatever the device is already on)
+
+  -f, --fullscreen      start full screen
+  -s, --size WxH        window size (default ${DEF_W}x${DEF_H}, 4:3)
+      --sharp           nearest-neighbour scaling; crisp pixels, no blur
+      --deinterlace M   linear (default) | yadif | weave | none
+                          linear  lowest latency, always safe
+                          weave   sharpest on 240p/288p progressive sources
+                                  such as retro consoles,
+                                  combs on real interlaced video
+                          yadif   best looking, costs ~1 frame of latency
+
+      --no-audio        do not start the audio loopback
+      --latency MS      audio loopback latency (default 15)
+
+      --reset           power-cycle the capture box first (runs elgato-reset)
+      --check           run the pre-flight checks and exit
+      --tune            sweep the driver's elgato_* fix knobs, measure each
+                        with --verify and report which one stabilises the
+                        picture. Needs root.
+      --verify [SECS]   measure frame integrity and exit (default 6s).
+                        Reports what fraction of frames the driver assembles
+                        correctly -- use it to A/B a driver change.
+  -d, --device PATH     V4L2 node (default: autodetect)
+  -h, --help            this
+
+To quit: close the window, or press Ctrl-C in this terminal.
+
+If it will not start, run  elgato-doctor  for a full diagnosis.
+EOF
+}
+
+# --------------------------------------------------------------- defaults ----
+DEF_W=960; DEF_H=720
+
+DEVICE=""
+INPUT="composite"
+STANDARD=""
+FULLSCREEN=0
+SIZE=""
+SCALE_METHOD="bilinear"
+DEINTERLACE="linear"
+WANT_AUDIO=1
+AUDIO_LATENCY="${ELGATO_AUDIO_LATENCY_MS:-15}"
+DO_RESET=0
+CHECK_ONLY=0
+VERIFY=0
+VERIFY_SECS=6
+TUNE=0
+BEST_SPEC=""
+
+# Options that take a value: report a missing one ourselves rather than
+# letting bash print its own message with a line number in it.
+need() { [[ $# -ge 2 && -n $2 ]] || die "$1 needs a value"; }
+
+while (( $# )); do
+    case "$1" in
+        -i|--input)       need "$@"; INPUT=$2; shift 2 ;;
+        --pal)            STANDARD="pal";  shift ;;
+        --ntsc)           STANDARD="ntsc"; shift ;;
+        -f|--fullscreen)  FULLSCREEN=1; shift ;;
+        -s|--size)        need "$@"; SIZE=$2; shift 2 ;;
+        --sharp)          SCALE_METHOD="nearest-neighbour"; shift ;;
+        --deinterlace)    need "$@"; DEINTERLACE=$2; shift 2 ;;
+        --no-audio)       WANT_AUDIO=0; shift ;;
+        --latency)        need "$@"; AUDIO_LATENCY=$2; shift 2 ;;
+        --reset)          DO_RESET=1; shift ;;
+        --check)          CHECK_ONLY=1; shift ;;
+        --tune)           TUNE=1; shift ;;
+        --verify)         VERIFY=1
+                          if [[ ${2:-} =~ ^[0-9]+$ ]]; then VERIFY_SECS=$2; shift; fi
+                          shift ;;
+        -d|--device)      need "$@"; DEVICE=$2; shift 2 ;;
+        -h|--help)        usage; exit 0 ;;
+        *)                usage >&2; die "unknown option: $1" ;;
+    esac
+done
+
+case "$INPUT" in
+    composite|composite1|comp|0) INPUT_N=0; INPUT_NAME="Composite" ;;
+    svideo|s-video|1)            INPUT_N=1; INPUT_NAME="S-Video" ;;
+    *) die "--input must be composite or svideo (got '$INPUT')" ;;
+esac
+
+case "$DEINTERLACE" in
+    linear|yadif|weave|none) ;;
+    *) die "--deinterlace must be linear, yadif, weave or none (got '$DEINTERLACE')" ;;
+esac
+
+if [[ -n $SIZE ]]; then
+    [[ $SIZE =~ ^([0-9]+)x([0-9]+)$ ]] || die "--size must look like 960x720 (got '$SIZE')"
+    OUT_W=${BASH_REMATCH[1]}; OUT_H=${BASH_REMATCH[2]}
+else
+    OUT_W=$DEF_W; OUT_H=$DEF_H
+fi
+
+for tool in gst-launch-1.0 v4l2-ctl; do
+    command -v "$tool" >/dev/null || die "$tool is not installed"
+done
+
+# --------------------------------------------------------------- helpers ----
+
+settle() { sleep 0.5; }
+
+# The capture chip exposes several /dev/video* nodes; only one of them actually
+# does video capture. Match on the card name and then confirm the capability,
+# so we never hand the pipeline the VBI or metadata node.
+find_device() {
+    local d caps
+    if [[ -c /dev/elgato ]]; then
+        echo /dev/elgato
+        return 0
+    fi
+    for d in /dev/video*; do
+        [[ -c $d ]] || continue
+        v4l2-ctl -d "$d" --info 2>/dev/null | grep -q "$CARD_NAME" || continue
+        caps=$(v4l2-ctl -d "$d" --info 2>/dev/null | sed -n '/Device Caps/,$p')
+        [[ $caps == *"Video Capture"* ]] || continue
+        echo "$d"
+        return 0
+    done
+    return 1
+}
+
+device_present() { lsusb 2>/dev/null | grep -qi "$USB_ID"; }
+
+# Count control-transfer failures since the box last enumerated. This hardware
+# wedges its USB link fairly readily; once it has, every symptom above it is a
+# red herring and only a power cycle clears it.
+usb_errors_since_plug() {
+    journalctl -k -b --no-pager 2>/dev/null | awk '
+        /cx231xx.*[Nn]ew device|USB Video Class|cx231xx.*successfully/ { n = 0 }
+        /cx231xx/ && /-71|EPROTO/                                     { n++ }
+        END { print n + 0 }'
+}
+
+delivers_frames() {
+    local dev=$1 count=${2:-10} secs=${3:-8}
+    timeout "$secs" v4l2-ctl -d "$dev" --stream-mmap --stream-count="$count" \
+        --stream-to=/dev/null >/dev/null 2>&1
+}
+
+# Frames arriving proves the USB path works, not that anything is plugged into
+# the yellow socket: with no source the decoder free-runs and emits a flat
+# blanking level at the nominal rate. A near-zero spread across the luma plane
+# is that flat level; anything else is a picture (or at least noise).
+has_picture() {
+    local dev=$1 raw spread
+    raw=$(mktemp) || return 0
+    if ! timeout 8 v4l2-ctl -d "$dev" --stream-mmap --stream-count=8 \
+            --stream-to="$raw" >/dev/null 2>&1; then
+        rm -f "$raw"; return 0
+    fi
+    # Sample a band from the VERTICAL MIDDLE of the last frame. Taking the
+    # tail of the file instead lands in the black band at the bottom of the
+    # picture, whose spread is zero -- which reported "no picture" on a
+    # perfectly good one.
+    local fsz lines skip
+    fsz=$(v4l2-ctl -d "$dev" --get-fmt-video 2>/dev/null | sed -n 's/.*Size Image *: *//p' | head -1)
+    [[ -n ${fsz:-} && $fsz -gt 0 ]] || fsz=829440
+    lines=$(( fsz / 1440 ))
+    (( lines < 8 )) && lines=576
+    # start of the last frame, then a third of the way down it
+    skip=$(( ($(stat -c%s "$raw") / fsz - 1) * fsz + (lines / 3) * 1440 ))
+    spread=$(dd if="$raw" bs=1 skip="$skip" count=200000 2>/dev/null | od -An -tu1 -v | awk '
+        { for (i = 1; i <= NF; i++) if ((c++) % 2 == 0) {
+              v = $i; n++; s += v; ss += v * v } }
+        END { if (n < 100) { print 999; exit }
+              m = s / n; d = ss / n - m * m; if (d < 0) d = 0
+              printf "%d\n", sqrt(d) }')
+    rm -f "$raw"
+    [[ -n $spread ]] && (( spread > 3 ))
+}
+
+# ------------------------------------------------------------- pre-flight ----
+
+preflight() {
+    local dev=$1 rc=0
+
+    if ! device_present; then
+        err "no Elgato Video Capture on the USB bus (expected $USB_ID)"
+        err "plug it into a direct USB-A port, not a hub"
+        return 1
+    fi
+
+    local eproto; eproto=$(usb_errors_since_plug)
+    if (( eproto > 0 )); then
+        warn "$eproto USB control-transfer errors since the box last enumerated"
+        warn "the link is probably wedged; if this fails, run:  ${0##*/} --reset"
+    fi
+
+    if ! delivers_frames "$dev"; then
+        err "the device is not delivering frames"
+        if (( eproto > 0 )); then
+            err "the USB link is wedged -- power-cycle it:  ${0##*/} --reset"
+        else
+            err "check the source is on and the standard is right (--pal / --ntsc)"
+            err "for a full diagnosis:  elgato-doctor"
+        fi
+        return 1
+    fi
+
+    # The decoder's horizontal lock is the difference between a picture you
+    # can play on and one that tears: measured 0% of frames corrupt with
+    # elgato_htl=2 against ~60% with it off. It is not the driver default, so
+    # say so rather than letting the picture look mysteriously bad.
+    local htl=/sys/module/cx231xx/parameters/elgato_htl
+    if [[ -r $htl && $(<"$htl") == 0 ]]; then
+        warn "elgato_htl is 0 -- the decoder's horizontal lock is not being set,"
+        warn "which tears roughly 60% of frames. Enable it with:"
+        warn "    sudo sh -c 'echo 2 > $htl' && v4l2-ctl -d $dev -s pal"
+        warn "or make it permanent in /etc/modprobe.d/cx231xx.conf:"
+        warn "    options cx231xx elgato_htl=2"
+    fi
+
+    if ! has_picture "$dev"; then
+        warn "frames are flowing but carry no picture -- the capture side is fine,"
+        warn "so check the yellow RCA lead is seated at both ends and the source"
+        warn "is powered on. Opening the window anyway."
+        rc=0
+    fi
+    return $rc
+}
+
+# ----------------------------------------------------------------- audio ----
+
+AUDIO_STARTED=0
+
+start_audio() {
+    (( WANT_AUDIO )) || return 0
+    local helper="$SELF_DIR/elgato-audio"
+    if [[ ! -x $helper ]]; then
+        warn "elgato-audio not found next to this script; running without sound"
+        return 0
+    fi
+    if ELGATO_AUDIO_LATENCY_MS="$AUDIO_LATENCY" "$helper" start; then
+        AUDIO_STARTED=1
+    else
+        warn "audio did not start -- video only. Run elgato-doctor to see why."
+    fi
+}
+
+stop_audio() {
+    (( AUDIO_STARTED )) || return 0
+    "$SELF_DIR/elgato-audio" stop >/dev/null 2>&1
+    AUDIO_STARTED=0
+}
+
+# The pipeline runs in the background (see the run loop) so that a signal
+# arriving here is handled straight away. Were gst-launch in the foreground,
+# bash would defer this trap until it exited -- and since the signal goes to
+# this script rather than to gst, that is never, leaving an orphaned pipeline
+# holding the capture device open so nothing else can use it.
+GST_PID=""
+
+kill_pipeline() {
+    [[ -n $GST_PID ]] || return 0
+    kill -0 "$GST_PID" 2>/dev/null || { GST_PID=""; return 0; }
+    # SIGINT first: gst-launch turns that into a clean shutdown, which releases
+    # the V4L2 buffers properly. Only escalate if it will not go.
+    kill -INT "$GST_PID" 2>/dev/null
+    local i
+    for i in $(seq 20); do
+        kill -0 "$GST_PID" 2>/dev/null || break
+        sleep 0.1
+    done
+    kill -0 "$GST_PID" 2>/dev/null && kill -KILL "$GST_PID" 2>/dev/null
+    GST_PID=""
+}
+
+cleanup() {
+    local rc=$?
+    trap - EXIT INT TERM
+    kill_pipeline
+    stop_audio
+    exit $rc
+}
+
+
+# ---------------------------------------------------------------- verify ----
+#
+# Counting delivered frames is not enough: this capture chip can hand over a
+# buffer of exactly the right size, at exactly the right rate, whose contents
+# are spliced together from two different moments in time. Those frames look
+# torn, and no amount of buffering downstream repairs them -- the data really
+# is mixed.
+#
+# The tell is temporal: if the driver alternates between assembling a frame
+# correctly and assembling one across a frame boundary, then consecutive frames
+# differ far more than frames two apart. On a healthy capture the two are
+# comparable. The ratio is the measurement.
+
+verify_stream() {
+    local dev=$1 secs=$2 raw w h sz
+    read -r w h sz < <(v4l2-ctl -d "$dev" --get-fmt-video 2>/dev/null | awk '
+        /Width\/Height/ { split($3, a, "/"); w = a[1]; h = a[2] }
+        /Size Image/     { sz = $4 }
+        END { print w, h, sz }')
+    [[ -n ${sz:-} && $sz -gt 0 ]] || { err "could not read the capture format"; return 1; }
+
+    local want=$(( secs * 25 ))
+    (( want < 20 )) && want=20
+    raw=$(mktemp) || return 1
+
+    msg "Capturing ${want} frames (${w}x${h}) to measure frame integrity..."
+    if ! timeout $(( secs + 12 )) v4l2-ctl -d "$dev" --stream-mmap \
+            --stream-count="$want" --stream-to="$raw" >/dev/null 2>&1; then
+        rm -f "$raw"; err "capture failed"; return 1
+    fi
+
+    python3 - "$raw" "$w" "$h" "$sz" "${3:-report}" <<'PYEOF'
+import sys
+
+path, w, h, sz = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+mode = sys.argv[5] if len(sys.argv) > 5 else "report"
+STEP_ROW  = 4     # rows sampled per frame
+STEP_PIX  = 8     # chroma samples per row
+THRESH    = 9.0   # mean |chroma difference| between lines two apart
+
+with open(path, 'rb') as fh:
+    data = fh.read()
+n = len(data) // sz
+if n < 4:
+    if mode != "report":
+        print("RATIO=nan")
+    else:
+        print("  not enough frames to judge")
+    sys.exit(1)
+
+# Corrupt frames on this capture chip show rainbow striping: the chroma
+# changes wildly from one line to the next. A clean picture has flat
+# colour fields, so lines two apart (same field, and skipping the duplicate
+# when progressive line-doubling is on) agree closely. Validated against
+# frames inspected by eye: clean scored 2.6, corrupt 13.5.
+stride = w * 2
+
+def chroma_score(fi):
+    base = fi * sz
+    tot = cnt = 0
+    for y in range(20, h - 2, STEP_ROW):
+        o1 = base + y * stride
+        o2 = base + (y + 2) * stride
+        for x in range(0, w * 2 - 4, 4 * STEP_PIX):
+            tot += abs(data[o1 + x + 1] - data[o2 + x + 1])   # U
+            tot += abs(data[o1 + x + 3] - data[o2 + x + 3])   # V
+            cnt += 2
+    return tot / cnt if cnt else 0.0
+
+# A black or disconnected input has perfectly coherent chroma -- zero
+# variation everywhere -- and would otherwise score a clean 0% corrupt. Refuse
+# to pass judgement when there is no picture to judge.
+def luma_spread(fi):
+    base = fi * sz
+    vals = []
+    for y in range(20, h - 2, STEP_ROW * 2):
+        o = base + y * stride
+        for x in range(0, w * 2 - 4, 4 * STEP_PIX):
+            vals.append(data[o + x])
+    m = sum(vals) / len(vals)
+    return (sum((v - m) ** 2 for v in vals) / len(vals)) ** 0.5
+
+detail = sum(luma_spread(i) for i in range(0, n, max(1, n // 8))) / len(range(0, n, max(1, n // 8)))
+if detail < 5.0:
+    if mode != "report":
+        print("RATIO=nan")
+    else:
+        print(f"  frames analysed : {n}")
+        print(f"  picture detail  : {detail:.1f}  (essentially flat)")
+        print()
+        print("  VERDICT: NO PICTURE -- frames are arriving but carry no image,")
+        print("  so there is nothing to judge. Check the source is on and the")
+        print("  lead is seated, then run this again.")
+    sys.exit(3)
+
+scores = [chroma_score(i) for i in range(n)]
+bad = sum(1 for v in scores if v > THRESH)
+pct = 100.0 * bad / n
+lo, hi = min(scores), max(scores)
+
+if mode != "report":
+    print(f"RATIO={pct:.2f}")
+    sys.exit(0 if pct <= 5.0 else 2)
+
+print(f"  frames analysed : {n}")
+print(f"  corrupt frames  : {bad} of {n}  ({pct:.1f}%)")
+print(f"  chroma spread   : {lo:.1f} (best frame) .. {hi:.1f} (worst)  threshold {THRESH}")
+print()
+if pct > 5.0:
+    print("  VERDICT: BROKEN -- corrupt frames show rainbow striping, i.e. the")
+    print("  chroma changes wildly line to line. A clean picture has flat")
+    print("  colour fields. This is below the player: raw v4l2 capture shows it.")
+    sys.exit(2)
+print("  VERDICT: OK -- colour is coherent line to line on every frame.")
+PYEOF
+    local rc=$?
+    rm -f "$raw"
+    return $rc
+}
+
+# Capture once and return just the ratio, for the sweep below.
+measure_ratio() {
+    verify_stream "$1" "$2" quiet 2>/dev/null | sed -n 's/^RATIO=//p'
+}
+
+# ------------------------------------------------------------------ tune ----
+#
+# The elgato_* knobs in the out-of-tree driver exist to fix exactly the fault
+# --verify measures, but they default to off, so nothing has ever applied them.
+# They take effect from cx231xx_do_mode_ctrl_overrides(), which the driver runs
+# on a standard change -- so writing the parameter and then re-setting the
+# standard is enough to apply one without reloading the module.
+
+# The sweep is run twice over, interleaved, so that drift in the source
+# material cannot masquerade as a difference between configurations.
+TUNE_CONFIGS=(
+    "baseline|htl=0 vdrst=0 timing=0 modectrl=0"
+    "htl (vendor constants)|htl=1 vdrst=0 timing=0 modectrl=0"
+    "htl + lock-acquire|htl=2 vdrst=0 timing=0 modectrl=0"
+    "htl2 + vd reset|htl=2 vdrst=1 timing=0 modectrl=0"
+    "htl2 + timing|htl=2 vdrst=0 timing=1 modectrl=0"
+    "htl2 + modectrl|htl=2 vdrst=0 timing=0 modectrl=1"
+    "timing only|htl=0 vdrst=0 timing=1 modectrl=0"
+    "everything|htl=2 vdrst=1 timing=1 modectrl=1"
+)
+TUNE_PASSES=${TUNE_PASSES:-2}
+
+apply_knobs() {
+    local spec=$1 kv k v
+
+    # elgato_progressive and elgato_fielddebounce were both tried and both
+    # made things worse; zero them so a sweep never measures them by accident.
+    for k in progressive fielddebounce; do
+        [[ -e /sys/module/cx231xx/parameters/elgato_$k ]] \
+            && echo 0 > "/sys/module/cx231xx/parameters/elgato_$k" 2>/dev/null
+    done
+    for kv in $spec; do
+        k=${kv%%=*}; v=${kv##*=}
+        echo "$v" > "/sys/module/cx231xx/parameters/elgato_$k" 2>/dev/null \
+            || { err "cannot write elgato_$k -- run this as root"; return 1; }
+    done
+    # The overrides are applied on a standard change; re-set the current one.
+    case "$(v4l2-ctl -d "$DEVICE" --get-standard 2>/dev/null | tail -1)" in
+        *NTSC*) v4l2-ctl -d "$DEVICE" -s ntsc >/dev/null 2>&1 ;;
+        *)      v4l2-ctl -d "$DEVICE" -s pal  >/dev/null 2>&1 ;;
+    esac
+    settle; settle
+}
+
+tune_sweep() {
+    if [[ $EUID -ne 0 ]]; then
+        err "--tune writes /sys/module/cx231xx/parameters/*, so it needs root:"
+        err "    sudo $(readlink -f "$0") --tune"
+        return 1
+    fi
+    [[ -d /sys/module/cx231xx/parameters ]] || { err "cx231xx is not loaded"; return 1; }
+    [[ -e /sys/module/cx231xx/parameters/elgato_htl ]] || {
+        err "this cx231xx has no elgato_* knobs -- it is not the out-of-tree build"
+        return 1; }
+
+    warn "These knobs write the decoder's PLL and horizontal-lock registers."
+    warn "If the picture is still gone when this finishes, the decoder is wedged;"
+    warn "setting the parameters back to 0 does NOT restore the old register"
+    warn "values -- only a power cycle does. Recover with:  elgato-reset"
+    echo
+    msg "Sweeping ${#TUNE_CONFIGS[@]} configurations (~20s each)."
+    msg "Figure is % of frames corrupt; <= 5% means the picture is stable."
+    echo
+
+    local best_name="" best_ratio="" line name spec ratio pass
+    declare -A SEEN
+    printf '  %-24s %-10s %s\n' "CONFIG" "%CORRUPT" "VERDICT"
+    printf '  %-24s %-10s %s\n' "------" "-----" "-------"
+    for pass in $(seq "$TUNE_PASSES"); do
+      (( TUNE_PASSES > 1 )) && printf '  -- pass %d --\n' "$pass"
+      for line in "${TUNE_CONFIGS[@]}"; do
+        name=${line%%|*}; spec=${line#*|}
+        apply_knobs "$spec" || return 1
+        ratio=$(measure_ratio "$DEVICE" 5)
+        [[ -z $ratio ]] && ratio="nan"
+        local verdict="broken"
+        if [[ $ratio != nan ]] && awk "BEGIN{exit !($ratio <= 5.0)}"; then
+            verdict="STABLE"
+        fi
+        printf '  %-24s %-10s %s\n' "$name" "$ratio" "$verdict"
+        if [[ $ratio != nan ]]; then
+            if [[ -z $best_ratio ]] || awk "BEGIN{exit !($ratio < $best_ratio)}"; then
+                best_ratio=$ratio; best_name=$name; BEST_SPEC=$spec
+            fi
+        fi
+      done
+    done
+
+    echo
+    warn "Compare each config against its OWN figure in the other pass. A"
+    warn "difference that does not survive both passes is drift in the source"
+    warn "material, not an effect of the setting."
+    echo
+    if [[ -n $best_name ]]; then
+        msg "Best: $best_name (${best_ratio}% of frames corrupt)"
+        apply_knobs "$BEST_SPEC"
+        msg "Left the device in that configuration."
+        msg "To make it permanent, add to /etc/modprobe.d/cx231xx.conf:"
+        local opts=""
+        for kv in $BEST_SPEC; do opts+=" elgato_${kv%%=*}=${kv##*=}"; done
+        printf '    options cx231xx%s\n' "$opts" >&2
+    else
+        err "every configuration failed to measure"
+        return 1
+    fi
+}
+
+
+# ------------------------------------------------------------------ sink ----
+
+pick_sink() {
+    if [[ -n ${ELGATO_VIEWER_SINK:-} ]]; then
+        echo "$ELGATO_VIEWER_SINK"
+    elif [[ -n ${WAYLAND_DISPLAY:-} ]] && gst-inspect-1.0 waylandsink >/dev/null 2>&1; then
+        local s="waylandsink sync=false"
+        (( FULLSCREEN )) && s+=" fullscreen=true"
+        echo "$s"
+    elif [[ -n ${DISPLAY:-} ]] && gst-inspect-1.0 xvimagesink >/dev/null 2>&1; then
+        (( FULLSCREEN )) && warn "--fullscreen needs waylandsink; resize the window instead"
+        echo "xvimagesink sync=false"
+    elif [[ -n ${DISPLAY:-} ]]; then
+        (( FULLSCREEN )) && warn "--fullscreen needs waylandsink; resize the window instead"
+        echo "ximagesink sync=false"
+    else
+        die "no display: neither WAYLAND_DISPLAY nor DISPLAY is set"
+    fi
+}
+
+# ------------------------------------------------------------------ main ----
+
+if (( DO_RESET )); then
+    reset_helper="$SELF_DIR/elgato-reset"
+    [[ -x $reset_helper ]] || die "elgato-reset not found next to this script"
+    msg "Power-cycling the capture box"
+    "$reset_helper" || warn "reset reported a problem; carrying on"
+    settle
+fi
+
+if [[ -n $DEVICE ]]; then
+    [[ -c $DEVICE ]] || die "$DEVICE is not a character device"
+else
+    DEVICE=$(find_device) || die "no Elgato capture node found. Is it plugged in? Try: elgato-doctor"
+fi
+
+msg "Device: $DEVICE"
+
+if [[ -n $STANDARD ]]; then
+    msg "Standard: ${STANDARD^^}"
+    v4l2-ctl -d "$DEVICE" -s "$STANDARD" >/dev/null 2>&1 \
+        || warn "could not set the $STANDARD standard"
+fi
+
+msg "Input: $INPUT_NAME"
+v4l2-ctl -d "$DEVICE" -i "$INPUT_N" >/dev/null 2>&1 \
+    || warn "could not select input $INPUT_N"
+settle
+
+preflight "$DEVICE" || exit 1
+
+if (( TUNE )); then
+    tune_sweep
+    exit $?
+fi
+
+if (( VERIFY )); then
+    verify_stream "$DEVICE" "$VERIFY_SECS"
+    exit $?
+fi
+
+if (( CHECK_ONLY )); then
+    cur_std=$(v4l2-ctl -d "$DEVICE" --get-standard 2>/dev/null | tail -1 | tr -d '\t')
+    msg "Pre-flight passed (${cur_std:-standard unknown}) -- ready to play."
+    exit 0
+fi
+
+# Correct the sample aspect on the way out. 720x576 and 720x480 are both 4:3
+# pictures made of non-square samples; scaling them to a square-pixel window
+# without saying so gives you a subtly stretched image.
+FMT_H=$(v4l2-ctl -d "$DEVICE" --get-fmt-video 2>/dev/null \
+        | sed -n 's|.*Width/Height *: *[0-9]*/\([0-9]*\).*|\1|p')
+case "${FMT_H:-576}" in
+    480) SRC_PAR="8/9"  ;;   # NTSC
+    *)   SRC_PAR="16/15" ;;  # PAL
+esac
+
+case "$DEINTERLACE" in
+    none)   DEINT="" ;;
+    weave)  DEINT="deinterlace mode=interlaced method=weave ! " ;;
+    yadif)  DEINT="deinterlace mode=interlaced method=yadif ! " ;;
+    linear) DEINT="deinterlace mode=interlaced method=linear ! " ;;
+esac
+
+SINK=$(pick_sink)
+
+PIPELINE="v4l2src device=$DEVICE io-mode=mmap
+    ! queue max-size-buffers=3 max-size-bytes=0 max-size-time=0 leaky=downstream
+    ! capssetter caps=video/x-raw,pixel-aspect-ratio=(fraction)$SRC_PAR
+    ! ${DEINT}videoconvert
+    ! videoscale method=$SCALE_METHOD
+    ! video/x-raw,width=$OUT_W,height=$OUT_H,pixel-aspect-ratio=(fraction)1/1
+    ! $SINK"
+
+trap cleanup EXIT INT TERM
+start_audio
+
+msg "Playing ${OUT_W}x${OUT_H}$( ((FULLSCREEN)) && echo " fullscreen")  (close the window or Ctrl-C to quit)"
+
+# A first STREAMON occasionally fails on a box that has just been reset or
+# replugged -- the alt-setting change races the decoder coming up. One retry
+# after a short settle turns that into a non-event rather than a failed launch.
+attempt=0
+while :; do
+    attempt=$((attempt + 1))
+    # shellcheck disable=SC2086  # the pipeline description must word-split
+    gst-launch-1.0 -q $PIPELINE &
+    GST_PID=$!
+    wait "$GST_PID"
+    rc=$?
+    GST_PID=""
+
+    (( rc == 0 )) && break                 # window closed, or clean EOS
+    (( rc == 130 || rc == 2 )) && break    # Ctrl-C
+    (( rc == 143 )) && break               # SIGTERM
+
+    if (( attempt == 1 )); then
+        warn "the pipeline stopped unexpectedly (exit $rc) -- retrying once"
+        settle; settle
+        continue
+    fi
+
+    err "could not keep the stream running (exit $rc)"
+    if (( $(usb_errors_since_plug) > 0 )); then
+        err "the USB link is wedged. Fix it with:  ${0##*/} --reset"
+    else
+        err "run  elgato-doctor  for a full diagnosis"
+    fi
+    exit 1
+done
+
+msg "Stopped."
