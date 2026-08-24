@@ -520,9 +520,11 @@ with open(path, 'rb') as fh:
     data = fh.read()
 n = len(data) // sz
 if n < 8:
-    print("QUALITY=nan")
-    if mode == "report":
-        print("  not enough frames to judge")
+    if mode != "report":
+        print("QUALITY=nan")
+    else:
+        print("  only %d frames captured -- not enough to judge." % n)
+        print("  The device may still be settling; wait a few seconds and retry.")
     sys.exit(1)
 
 stride = w * 2
@@ -567,8 +569,9 @@ for fi in picks:
     vs.append(pct(vgrad, 95))
 
 if not cs:
-    print("QUALITY=nan")
-    if mode == "report":
+    if mode != "report":
+        print("QUALITY=nan")
+    else:
         print("  the picture has too little contrast to measure crosstalk")
     sys.exit(1)
 
