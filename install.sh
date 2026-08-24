@@ -24,7 +24,7 @@ set -uo pipefail
 SELF_DIR=$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd)
 KVER=$(uname -r)
 MOD_DIR="/lib/modules/$KVER/updates/cx231xx"
-TOOLS=(elgato-viewer elgato-audio elgato-doctor elgato-reset)
+TOOLS=(elgato-viewer elgato-audio elgato-doctor elgato-reset elgato-obs-setup)
 
 if [[ -t 1 ]]; then
     G=$'\033[1;32m'; Y=$'\033[1;33m'; R=$'\033[1;31m'; O=$'\033[0m'

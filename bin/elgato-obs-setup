@@ -1,0 +1,661 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Hypnotize
+# elgato-obs-setup -- write an OBS profile and scene collection for the
+#                     Elgato Video Capture.
+#
+# OBS captures this card without any help from this repository: the fix that
+# matters lives in the kernel module, so OBS is handed the same clean frames
+# elgato-viewer gets. What OBS cannot do is guess the settings that are wrong
+# by default for an SDTV capture card, and every one of them is buried:
+#
+#  * The card implements neither VIDIOC_ENUM_FRAMESIZES nor
+#    VIDIOC_ENUM_FRAMEINTERVALS, so OBS's Resolution and Frame Rate lists
+#    contain nothing but "Leave Unchanged". The TV standard picks the format;
+#    anything else fails to open the device.
+#  * PAL is 720x576 sampled with 54:59 pixels. OBS assumes square pixels, so
+#    the picture has to be stretched onto a 4:3 canvas or everything is tall.
+#  * The source is interlaced, and OBS deinterlaces per scene item -- in a
+#    right-click submenu, off by default.
+#  * 50 fields per second become 50 real frames per second with a 2x
+#    deinterlacer, but only if the canvas also runs at 50fps.
+#  * The audio has to come from PipeWire, not ALSA. Only one client may open
+#    the raw ALSA device, and elgato-audio's loopback already has it.
+#
+# All of this is plain files on disk. OBS reads them at startup and rewrites
+# them at exit, so it must not be running while this writes.
+#
+# See OBS.md for what to do with the result, and for the one rule that governs
+# everything: only one program at a time can own /dev/elgato.
+
+set -uo pipefail
+
+SELF_DIR=$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd)
+# shellcheck source=../lib/elgato-common.sh
+source "$SELF_DIR/../lib/elgato-common.sh"
+
+FLATPAK_ID="com.obsproject.Studio"
+MAIN_CANVAS_UUID="6c69626f-6273-4c00-9d88-c5136d61696e"
+
+# --------------------------------------------------------------- defaults ----
+NAME="Elgato"
+FLAVOUR=""              # native | flatpak | "" = detect
+DEVICE=""               # "" = detect, prefers the /dev/elgato symlink
+INPUT=""                # composite | svideo; "" = whatever the card is on
+STANDARD=""             # pal | ntsc;         "" = whatever the card is on
+CANVAS=""               # WxH; "" = 960x720
+FPS=""                  # "" = 2x the field rate of the standard
+DEINTERLACE="yadif2x"
+FIELD_ORDER="top"
+SCALE_FILTER="bicubic"
+BUFFERING=0
+WITH_AUDIO=1
+AUDIO_DEVICE=""
+REC_DIR=""
+ACTIVATE=1
+FORCE=0
+DRY_RUN=0
+
+usage() {
+    cat <<EOF
+usage: ${0##*/} [options]
+
+Write an OBS profile and scene collection set up for the Elgato Video Capture.
+OBS must not be running: it rewrites its configuration on exit and would
+discard this.
+
+  --name NAME         name for both the profile and the scene collection
+                      (default: $NAME)
+      --native        write to ~/.config/obs-studio
+      --flatpak       write to ~/.var/app/$FLATPAK_ID/config/obs-studio
+                      (default: whichever is installed and configured)
+
+  -d, --device PATH   V4L2 node (default: /dev/elgato, the udev symlink)
+  -i, --input WHICH   composite | svideo   (default: leave the card alone)
+      --pal           force the PAL standard
+      --ntsc          force the NTSC standard
+                      (default: whatever the card is already set to)
+
+      --canvas WxH    canvas and output size (default 960x720, 4:3)
+      --fps N         canvas frame rate: 25, 50, 29.97 or 59.94
+                      (default: 50 for PAL, 59.94 for NTSC -- one frame per
+                      field, which is what the 2x deinterlacer produces)
+      --deinterlace M yadif2x (default) | yadif | linear2x | linear | blend
+                      | discard | none
+      --field top|bottom   field order (default top)
+      --sharp         nearest-neighbour scaling; crisp pixels, no blur
+      --buffering     let the V4L2 source buffer frames (smoother under load,
+                      more latency; off by default)
+
+      --no-audio      do not add the audio source
+      --audio-device NODE   PipeWire/PulseAudio source name to capture
+                      (default: autodetect the Elgato capture node)
+      --recordings DIR      where OBS writes recordings
+                      (default: \$(xdg-user-dir VIDEOS)/elgato)
+
+      --no-activate   write the files but leave OBS pointed at its current
+                      profile and scene collection
+      --force         overwrite an existing profile or scene collection
+  -n, --dry-run       print what would be written, write nothing
+  -h, --help          this
+EOF
+}
+
+while (( $# )); do
+    case "$1" in
+        --name)         NAME=$2; shift 2 ;;
+        --native)       FLAVOUR=native; shift ;;
+        --flatpak)      FLAVOUR=flatpak; shift ;;
+        -d|--device)    DEVICE=$2; shift 2 ;;
+        -i|--input)     INPUT=$2; shift 2 ;;
+        --pal)          STANDARD=pal; shift ;;
+        --ntsc)         STANDARD=ntsc; shift ;;
+        --canvas)       CANVAS=$2; shift 2 ;;
+        --fps)          FPS=$2; shift 2 ;;
+        --deinterlace)  DEINTERLACE=$2; shift 2 ;;
+        --field)        FIELD_ORDER=$2; shift 2 ;;
+        --sharp)        SCALE_FILTER=point; shift ;;
+        --buffering)    BUFFERING=1; shift ;;
+        --no-audio)     WITH_AUDIO=0; shift ;;
+        --audio-device) AUDIO_DEVICE=$2; shift 2 ;;
+        --recordings)   REC_DIR=$2; shift 2 ;;
+        --no-activate)  ACTIVATE=0; shift ;;
+        --force)        FORCE=1; shift ;;
+        -n|--dry-run)   DRY_RUN=1; shift ;;
+        -h|--help)      usage; exit 0 ;;
+        *) die "unknown option: $1 (try --help)" ;;
+    esac
+done
+
+# OBS derives the scene collection's filename from its name. Keep the two the
+# same by refusing names that would not survive the round trip.
+[[ $NAME =~ ^[A-Za-z0-9][A-Za-z0-9\ ._-]*$ ]] \
+    || die "--name must be letters, digits, spaces, dot, dash or underscore"
+
+case $DEINTERLACE in
+    none)     DEINT_MODE=0 ;;
+    discard)  DEINT_MODE=1 ;;
+    retro)    DEINT_MODE=2 ;;
+    blend)    DEINT_MODE=3 ;;
+    blend2x)  DEINT_MODE=4 ;;
+    linear)   DEINT_MODE=5 ;;
+    linear2x) DEINT_MODE=6 ;;
+    yadif)    DEINT_MODE=7 ;;
+    yadif2x)  DEINT_MODE=8 ;;
+    *) die "unknown --deinterlace: $DEINTERLACE (try --help)" ;;
+esac
+case $FIELD_ORDER in
+    top)    FIELD_NUM=0 ;;
+    bottom) FIELD_NUM=1 ;;
+    *) die "--field must be top or bottom" ;;
+esac
+
+# ------------------------------------------------------------ which OBS? ----
+# Both packagings can be installed at once -- this machine had exactly that --
+# and they keep entirely separate configuration trees. Guessing wrong writes a
+# perfectly good profile somewhere OBS will never look, so prefer the one that
+# has actually been run, and say which was chosen.
+NATIVE_CFG="${XDG_CONFIG_HOME:-$HOME/.config}/obs-studio"
+FLATPAK_CFG="$HOME/.var/app/$FLATPAK_ID/config/obs-studio"
+
+has_native()  { command -v obs >/dev/null; }
+has_flatpak() { flatpak info "$FLATPAK_ID" >/dev/null 2>&1; }
+
+if [[ -z $FLAVOUR ]]; then
+    if   [[ -d $NATIVE_CFG  ]] && has_native;  then FLAVOUR=native
+    elif [[ -d $FLATPAK_CFG ]] && has_flatpak; then FLAVOUR=flatpak
+    elif has_native;  then FLAVOUR=native
+    elif has_flatpak; then FLAVOUR=flatpak
+    else die "OBS Studio is not installed (looked for 'obs' and the $FLATPAK_ID flatpak)"
+    fi
+    if [[ -d $NATIVE_CFG && -d $FLATPAK_CFG ]]; then
+        warn "Both the native and the flatpak OBS have configuration here."
+        warn "Writing to the $FLAVOUR one; use --native or --flatpak to pick."
+    fi
+fi
+
+case $FLAVOUR in
+    native)  CFG=$NATIVE_CFG
+             has_native || warn "no 'obs' in PATH, but writing the native config anyway"
+             OBS_VERSION=$(obs --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1) ;;
+    flatpak) CFG=$FLATPAK_CFG
+             has_flatpak || warn "the $FLATPAK_ID flatpak is not installed, but writing its config anyway"
+             OBS_VERSION=$(flatpak info "$FLATPAK_ID" 2>/dev/null | sed -n 's/^ *Version: *//p' | head -1) ;;
+esac
+
+# OBS stamps every source it saves with the version that wrote it, and uses
+# that to decide which settings migrations to run on load. A source claiming to
+# come from version 0 gets put through fifteen years of them.
+[[ -n ${OBS_VERSION:-} ]] || OBS_VERSION=32.0.0
+IFS=. read -r V_MAJ V_MIN V_PATCH <<< "$OBS_VERSION"
+PREV_VER=$(( (V_MAJ << 24) | (V_MIN << 16) | V_PATCH ))
+
+# OBS holds its whole configuration in memory and writes it out at exit, so
+# anything written underneath a running instance is silently reverted.
+if pgrep -x obs >/dev/null 2>&1; then
+    die "OBS is running. Quit it first -- it rewrites its configuration on exit."
+fi
+
+# ------------------------------------------------------------- the device ----
+# Prefer /dev/elgato: the udev rule guarantees it points at this card, whereas
+# the video node number moves when the built-in webcam re-enumerates. The cost
+# is that OBS's own device dropdown lists /dev/videoN only, so the Properties
+# dialog will not show this path selected -- see OBS.md.
+if [[ -z $DEVICE ]]; then
+    if [[ -c /dev/elgato ]]; then
+        DEVICE=/dev/elgato
+    else
+        DEVICE=$(find_device) || DEVICE=""
+        [[ -n $DEVICE ]] && warn "no /dev/elgato symlink; pinning $DEVICE, which can move"
+    fi
+fi
+[[ -n $DEVICE ]] || die "no Elgato Video Capture found and no --device given"
+[[ -c $DEVICE ]] || warn "$DEVICE is not a character device right now"
+
+# Input and standard. Reading them off the card beats a default: whatever it is
+# set to is what the user last watched successfully.
+INPUT_NUM=0
+if [[ -n $INPUT ]]; then
+    case $INPUT in
+        composite|0) INPUT_NUM=0 ;;
+        svideo|1)    INPUT_NUM=1 ;;
+        *) die "--input must be composite or svideo" ;;
+    esac
+elif [[ -c $DEVICE ]]; then
+    INPUT_NUM=$(v4l2-ctl -d "$DEVICE" --get-input 2>/dev/null | grep -oE '[0-9]+' | head -1)
+    [[ -n $INPUT_NUM ]] || INPUT_NUM=0
+fi
+
+# v4l2_std_id values as this card enumerates them: 0xff is the PAL-B/G/H/I/D/K
+# family, 0xb000 the NTSC one. OBS stores the id, not the index, so these have
+# to match an entry the driver reports or OBS shows a blank standard.
+STD_PAL=255
+STD_NTSC=45056
+case $STANDARD in
+    pal)  STD_ID=$STD_PAL ;;
+    ntsc) STD_ID=$STD_NTSC ;;
+    "")
+        STD_ID=""
+        if [[ -c $DEVICE ]]; then
+            std_hex=$(v4l2-ctl -d "$DEVICE" --get-standard 2>/dev/null | grep -oE '0x[0-9a-fA-F]+' | head -1)
+            [[ -n $std_hex ]] && STD_ID=$(( std_hex ))
+        fi
+        [[ -n $STD_ID && $STD_ID -gt 0 ]] || STD_ID=$STD_PAL
+        ;;
+esac
+# Line count, not the family name, decides the field rate -- PAL-M and PAL-60
+# are 525-line and run at 29.97 like NTSC does. 0xf900 is every 525-line id
+# this driver enumerates; 0x6ff is the 625-line PAL ones and 0xff0000 SECAM.
+if (( (STD_ID & 0xf900) && !(STD_ID & 0x0006ff) && !(STD_ID & 0xff0000) )); then
+    STD_NAME="525-line"; FIELD_RATE=59.94
+else
+    STD_NAME="625-line"; FIELD_RATE=50
+fi
+
+# YUYV 4:2:2 -- the only format this decoder emits.
+PIXELFORMAT=$(python3 -c "print(int.from_bytes(b'YUYV','little'))")
+
+# ------------------------------------------------------------ the canvas ----
+if [[ -n $CANVAS ]]; then
+    [[ $CANVAS =~ ^([0-9]+)x([0-9]+)$ ]] || die "--canvas wants WxH, e.g. 960x720"
+    CW=${BASH_REMATCH[1]}; CH=${BASH_REMATCH[2]}
+else
+    CW=960; CH=720
+fi
+
+# One canvas frame per captured field. The card delivers 25 (or 29.97)
+# interlaced frames a second, each holding two moments 20ms apart; a 2x
+# deinterlacer turns those into 50 (or 59.94) distinct frames, but only if
+# there is somewhere to put them.
+[[ -n $FPS ]] || FPS=$FIELD_RATE
+case $FPS in
+    29.97|29,97) FPS_TYPE=2; FPS_NUM=30000; FPS_DEN=1001 ;;
+    59.94|59,94) FPS_TYPE=2; FPS_NUM=60000; FPS_DEN=1001 ;;
+    *)
+        [[ $FPS =~ ^[0-9]+$ ]] || die "--fps wants 25, 50, 29.97 or 59.94"
+        FPS_TYPE=1; FPS_INT=$FPS ;;
+esac
+case $DEINT_MODE in
+    4|6|8) ;;  # the 2x modes: one output frame per field, which is the point
+    *) [[ ${FPS%.*} -ge 50 ]] && warn "--fps $FPS with a non-2x deinterlacer only duplicates frames" ;;
+esac
+
+# ------------------------------------------------------------- the audio ----
+# Never the ALSA plugin. Only one client may open the raw capture device, and
+# elgato-audio's loopback is holding it; PipeWire hands the same stream to any
+# number of readers, which is why the loopback and OBS can both have it.
+if (( WITH_AUDIO )) && [[ -z $AUDIO_DEVICE ]]; then
+    AUDIO_DEVICE=$(find_audio_node)
+    if [[ -z $AUDIO_DEVICE ]]; then
+        AUDIO_DEVICE=$(pactl list short sources 2>/dev/null \
+            | awk -v p="$ELGATO_AUDIO_PATTERN" '$2 ~ "^" p {print $2; exit}')
+    fi
+    if [[ -z $AUDIO_DEVICE ]]; then
+        warn "No Elgato audio source in PipeWire -- skipping the audio source."
+        warn "Plug the card in and re-run, or add Audio Input Capture by hand."
+        WITH_AUDIO=0
+    fi
+fi
+
+if [[ -z $REC_DIR ]]; then
+    videos=$(xdg-user-dir VIDEOS 2>/dev/null)
+    [[ -n $videos && $videos != "$HOME" ]] || videos="$HOME/Videos"
+    REC_DIR="$videos/elgato"
+fi
+
+# -------------------------------------------------------------- the files ----
+SCENES_DIR="$CFG/basic/scenes"
+PROFILE_DIR="$CFG/basic/profiles/$NAME"
+SCENE_FILE="$SCENES_DIR/$NAME.json"
+PROFILE_FILE="$PROFILE_DIR/basic.ini"
+
+echo
+msg "OBS:        $FLAVOUR $OBS_VERSION  ($CFG)"
+msg "Device:     $DEVICE  input $INPUT_NUM  $STD_NAME (0x$(printf '%x' "$STD_ID"))"
+msg "Canvas:     ${CW}x${CH} @ ${FPS}fps, $DEINTERLACE ($FIELD_ORDER field first)"
+if (( WITH_AUDIO )); then
+    msg "Audio:      $AUDIO_DEVICE"
+else
+    msg "Audio:      none"
+fi
+msg "Recordings: $REC_DIR"
+echo
+
+if (( ! FORCE && ! DRY_RUN )); then
+    [[ -e $SCENE_FILE   ]] && die "$SCENE_FILE exists (use --force, or --name)"
+    [[ -e $PROFILE_FILE ]] && die "$PROFILE_FILE exists (use --force, or --name)"
+fi
+
+# --- scene collection -------------------------------------------------------
+#
+# Two sources and a scene. The geometry is worth reading twice: the scene item
+# uses bounds_type 1 (stretch) with the bounds set to the whole canvas, so the
+# 720x576 picture is stretched to fill it. That is not laziness -- PAL samples
+# 54:59 pixels and OBS assumes square ones, so a "correct" aspect-preserving
+# fit would render everybody 11% too tall. A 4:3 canvas plus stretch is the
+# anamorphic correction.
+build_scene_json() {
+    OBS_NAME="$NAME" OBS_PREV_VER="$PREV_VER" OBS_CANVAS_UUID="$MAIN_CANVAS_UUID" \
+    OBS_DEVICE="$DEVICE" OBS_INPUT="$INPUT_NUM" OBS_STD="$STD_ID" \
+    OBS_PIXFMT="$PIXELFORMAT" OBS_BUFFERING="$BUFFERING" \
+    OBS_DEINT="$DEINT_MODE" OBS_FIELD="$FIELD_NUM" OBS_SCALE="$SCALE_FILTER" \
+    OBS_CW="$CW" OBS_CH="$CH" \
+    OBS_AUDIO="$([[ $WITH_AUDIO -eq 1 ]] && echo "$AUDIO_DEVICE")" \
+    python3 <<'PY'
+import json, os, uuid
+
+name       = os.environ["OBS_NAME"]
+prev_ver   = int(os.environ["OBS_PREV_VER"])
+cw, ch     = int(os.environ["OBS_CW"]), int(os.environ["OBS_CH"])
+audio_dev  = os.environ["OBS_AUDIO"]
+
+def source(sname, sid, settings, **extra):
+    d = {
+        "prev_ver": prev_ver,
+        "name": sname,
+        "uuid": str(uuid.uuid4()),
+        "id": sid,
+        "versioned_id": sid,
+        "settings": settings,
+        "mixers": 0,
+        "sync": 0,
+        "flags": 0,
+        "volume": 1.0,
+        "balance": 0.5,
+        "enabled": True,
+        "muted": False,
+        "push-to-mute": False,
+        "push-to-mute-delay": 0,
+        "push-to-talk": False,
+        "push-to-talk-delay": 0,
+        "hotkeys": {},
+        "deinterlace_mode": 0,
+        "deinterlace_field_order": 0,
+        "monitoring_type": 0,
+        "private_settings": {},
+    }
+    d.update(extra)
+    return d
+
+# Resolution and framerate are -1, OBS's "Leave Unchanged". The card answers
+# VIDIOC_ENUM_FRAMESIZES with EINVAL, so there is nothing else to pick, and the
+# TV standard already determines 720x576 or 720x480.
+video = source(
+    "Elgato Video Capture", "v4l2_input",
+    {
+        "device_id": os.environ["OBS_DEVICE"],
+        "input": int(os.environ["OBS_INPUT"]),
+        "standard": int(os.environ["OBS_STD"]),
+        "pixelformat": int(os.environ["OBS_PIXFMT"]),
+        "resolution": -1,
+        "framerate": -1,
+        # The decoder emits limited-range YUV; telling OBS "full" is the classic
+        # crushed-blacks, blown-highlights mistake.
+        "color_range": "partial",
+        "buffering": os.environ["OBS_BUFFERING"] == "1",
+        "auto_reset": True,
+        "timeout_frames": 5,
+    },
+    deinterlace_mode=int(os.environ["OBS_DEINT"]),
+    deinterlace_field_order=int(os.environ["OBS_FIELD"]),
+)
+
+sources = [video]
+
+if audio_dev:
+    # mixers 255 puts it on every track; monitoring_type 0 is "Monitor Off",
+    # because elgato-audio's loopback is already playing this to the speakers
+    # and monitoring it here as well gives you both, a few milliseconds apart.
+    sources.append(source(
+        "Elgato Audio", "pulse_input_capture",
+        {"device_id": audio_dev},
+        mixers=255,
+        hotkeys={"libobs.mute": [], "libobs.unmute": [],
+                 "libobs.push-to-mute": [], "libobs.push-to-talk": []},
+    ))
+
+# OBS 31 and later store each item's geometry twice: absolute pixels, and
+# normalised to a canvas spanning [-aspect, +aspect] by [-1, +1] so a canvas
+# resize can carry the layout with it. Both have to agree.
+aspect = cw / ch
+item = {
+    "name": video["name"],
+    "source_uuid": video["uuid"],
+    "visible": True,
+    "locked": False,
+    "rot": 0.0,
+    "scale_ref": {"x": float(cw), "y": float(ch)},
+    "align": 5,                      # OBS_ALIGN_LEFT | OBS_ALIGN_TOP
+    "bounds_type": 1,                # OBS_BOUNDS_STRETCH
+    "bounds_align": 0,
+    "bounds_crop": False,
+    "crop_left": 0, "crop_top": 0, "crop_right": 0, "crop_bottom": 0,
+    "id": 1,
+    "group_item_backup": False,
+    "pos": {"x": 0.0, "y": 0.0},
+    "pos_rel": {"x": -aspect, "y": -1.0},
+    "scale": {"x": 1.0, "y": 1.0},
+    "scale_rel": {"x": 1.0, "y": 1.0},
+    "bounds": {"x": float(cw), "y": float(ch)},
+    "bounds_rel": {"x": 2.0 * aspect, "y": 2.0},
+    "scale_filter": os.environ["OBS_SCALE"],
+    "blend_method": "default",
+    "blend_type": "normal",
+    "show_transition": {"duration": 300},
+    "hide_transition": {"duration": 300},
+    "private_settings": {},
+}
+
+scene = source(
+    name, "scene",
+    {"id_counter": 2, "custom_size": False, "items": [item]},
+    hotkeys={"OBSBasic.SelectScene": []},
+    canvas_uuid=os.environ["OBS_CANVAS_UUID"],
+)
+sources.append(scene)
+
+# No DesktopAudioDevice1 and no AuxAudioDevice1: absent means disabled. Desktop
+# Audio would otherwise record the loopback playing the capture to the
+# speakers, i.e. this card's own sound a second time and slightly later.
+collection = {
+    "name": name,
+    "current_scene": name,
+    "current_program_scene": name,
+    "scene_order": [{"name": name}],
+    "current_transition": "Fade",
+    "transition_duration": 300,
+    "transitions": [],
+    "canvases": [],
+    "sources": sources,
+    "groups": [],
+    "quick_transitions": [],
+    "saved_projectors": [],
+    "preview_locked": False,
+    "scaling_enabled": False,
+    "scaling_level": 0,
+    "scaling_off_x": 0.0,
+    "scaling_off_y": 0.0,
+    "modules": {},
+    "version": 2,
+}
+
+print(json.dumps(collection, indent=4))
+PY
+}
+
+# --- profile ----------------------------------------------------------------
+build_profile_ini() {
+    cat <<EOF
+[General]
+Name=$NAME
+
+[Video]
+BaseCX=$CW
+BaseCY=$CH
+OutputCX=$CW
+OutputCY=$CH
+FPSType=$FPS_TYPE
+EOF
+    if [[ $FPS_TYPE -eq 2 ]]; then
+        printf 'FPSNum=%s\nFPSDen=%s\n' "$FPS_NUM" "$FPS_DEN"
+    else
+        printf 'FPSInt=%s\n' "$FPS_INT"
+    fi
+    cat <<EOF
+ScaleType=bicubic
+ColorFormat=NV12
+ColorSpace=601
+ColorRange=Partial
+
+[Audio]
+SampleRate=48000
+ChannelSetup=Stereo
+
+[Output]
+Mode=Simple
+
+[SimpleOutput]
+FilePath=$REC_DIR
+RecFormat2=mkv
+RecQuality=HQ
+RecEncoder=x264
+VBitrate=2500
+ABitrate=160
+UseAdvanced=false
+EOF
+}
+
+if (( DRY_RUN )); then
+    msg "Would write $PROFILE_FILE:"
+    build_profile_ini | sed 's/^/    /'
+    echo
+    msg "Would write $SCENE_FILE:"
+    build_scene_json | sed 's/^/    /'
+    (( ACTIVATE )) && { echo; msg "Would make '$NAME' the active profile and scene collection."; }
+    exit 0
+fi
+
+mkdir -p "$SCENES_DIR" "$PROFILE_DIR" || die "cannot create $CFG"
+mkdir -p "$REC_DIR" || warn "could not create $REC_DIR"
+
+# Keep one backup of anything replaced. OBS keeps its own .bak of scene
+# collections, and overwriting a hand-built scene without a copy would be rude.
+for f in "$SCENE_FILE" "$PROFILE_FILE"; do
+    [[ -e $f ]] && cp -f -- "$f" "$f.before-elgato" && warn "kept $f.before-elgato"
+done
+
+scene_json=$(build_scene_json) || die "failed to build the scene collection"
+printf '%s\n' "$scene_json" > "$SCENE_FILE" || die "cannot write $SCENE_FILE"
+build_profile_ini > "$PROFILE_FILE" || die "cannot write $PROFILE_FILE"
+
+msg "Wrote $SCENE_FILE"
+msg "Wrote $PROFILE_FILE"
+
+# --- make it the active one -------------------------------------------------
+#
+# OBS 30.2 split its settings: per-user state, including which profile and
+# collection are loaded, moved from global.ini to user.ini. Write whichever
+# this installation actually uses.
+if (( ACTIVATE )); then
+    INI="$CFG/user.ini"
+    [[ -f $INI ]] || INI="$CFG/global.ini"
+    if [[ ! -f $INI ]]; then
+        warn "no user.ini or global.ini yet -- pick '$NAME' from OBS's menus once"
+    else
+        # Match the existing convention for whether the filename carries .json:
+        # it changed in OBS 31 and getting it wrong loads an empty collection.
+        cur=$(sed -n 's/^SceneCollectionFile=//p' "$INI" | head -1)
+        if [[ -n $cur && $cur != *.json ]]; then
+            COLL_FILE="$NAME"
+        else
+            COLL_FILE="$NAME.json"
+        fi
+
+        cp -f -- "$INI" "$INI.before-elgato"
+        INI_PATH="$INI" \
+        SET_KEYS="Basic/Profile=$NAME
+Basic/ProfileDir=$NAME
+Basic/SceneCollection=$NAME
+Basic/SceneCollectionFile=$COLL_FILE
+General/FirstRun=false" \
+        python3 <<'PY'
+import os, re, sys
+
+path = os.environ["INI_PATH"]
+wanted = {}
+for line in os.environ["SET_KEYS"].splitlines():
+    sec_key, _, value = line.partition("=")
+    section, _, key = sec_key.partition("/")
+    wanted.setdefault(section, {})[key] = value
+
+with open(path, encoding="utf-8") as fh:
+    lines = fh.read().splitlines()
+
+# Rewrite in place rather than round-tripping through a parser: OBS's ini
+# holds base64 window state whose values contain '=' and trailing padding, and
+# reformatting it is a good way to lose a docking layout.
+out, section, seen = [], None, {s: set() for s in wanted}
+
+def flush(section):
+    """Append the keys of `section` that were not already present."""
+    for key, value in wanted.get(section, {}).items():
+        if key not in seen[section]:
+            out.append(f"{key}={value}")
+            seen[section].add(key)
+
+for line in lines:
+    m = re.match(r"^\[(.+)\]\s*$", line)
+    if m:
+        if section in wanted:
+            while out and not out[-1].strip():
+                out.pop()
+            flush(section)
+            out.append("")
+        section = m.group(1)
+        out.append(line)
+        continue
+    if section in wanted:
+        k = line.split("=", 1)[0].strip()
+        if k in wanted[section]:
+            out.append(f"{k}={wanted[section][k]}")
+            seen[section].add(k)
+            continue
+    out.append(line)
+
+if section in wanted:
+    flush(section)
+
+for missing in (s for s in wanted if not seen[s]):
+    out += ["", f"[{missing}]"]
+    flush(missing)
+
+with open(path, "w", encoding="utf-8") as fh:
+    fh.write("\n".join(out).rstrip("\n") + "\n")
+PY
+        if (( $? == 0 )); then
+            msg "Made '$NAME' the active profile and scene collection ($INI)"
+            msg "Disabled OBS's first-run wizard -- it would overwrite this profile"
+        else
+            cp -f -- "$INI.before-elgato" "$INI"
+            warn "could not update $INI -- pick '$NAME' from OBS's menus instead"
+        fi
+    fi
+fi
+
+# ---------------------------------------------------------------- summary ----
+echo
+msg "Done. Start OBS and you should see the picture."
+echo
+cat >&2 <<EOF
+  Nothing else may hold $DEVICE while OBS has it -- quit elgato-viewer first.
+  To watch with low latency instead, use elgato-viewer and capture its window.
+
+  In OBS:
+    Preview is not a monitor -- right-click it, Fullscreen Projector (Preview),
+    or Windowed Projector on a second screen.
+    Deinterlacing is on the source's right-click menu if you want to compare.
+    Properties on the video source lists /dev/videoN only, so it will not show
+    $DEVICE selected. Cancel that dialog rather than OK-ing it.
+
+  See OBS.md for the rest.
+EOF
