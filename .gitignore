@@ -13,6 +13,10 @@ Module.symvers
 *.rej
 *.orig
 
+# Python bytecode
+__pycache__/
+*.py[cod]
+
 # Editor / OS noise
 *~
 *.swp
