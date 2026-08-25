@@ -98,7 +98,7 @@ ACTION=${1:-status}
 shift || true
 
 case "$ACTION" in
-    local)  use_local "$@" && msg "Device ready. Run: nes-quality" ;;
+    local)  use_local "$@" && msg "Device ready. Score it with: elgato-viewer --verify" ;;
     stock)  use_stock && msg "Device ready (distro driver)." ;;
     status) show_status ;;
     *) die "usage: ${0##*/} {local [param=value ...]|stock|status}" ;;

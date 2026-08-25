@@ -160,8 +160,53 @@ The script refuses rather than letting that happen.
 | Desktop Audio | disabled | it would record the loopback playing the capture to your speakers: this card's own sound a second time, and slightly later |
 | recording format | MKV | a killed or crashed OBS leaves a playable MKV. Remux to MP4 afterwards (**File → Remux Recordings**) |
 
-`--dry-run` prints both files without writing anything, which is the quickest
-way to see what any of the options does.
+### What `--share` changes
+
+Only three of those settings differ, and the picture ones do not move at all —
+that is the point of sending the loopback the card's own frames.
+
+| setting | with `--share` | why |
+| ------- | -------------- | --- |
+| device | `/dev/elgato-share` | the loopback the viewer publishes on. `video_nr` pins it, and the udev rule names it, so it does not move either |
+| resolution, frame rate | still *Leave Unchanged* | the loopback *does* implement `VIDIOC_ENUM_FRAMESIZES`, so for once the Properties dropdowns are populated — but leaving it alone keeps the format following whatever the viewer publishes, PAL or NTSC, and stops OBS calling `S_FMT` on a device whose format belongs to the writer |
+| `auto_reset` | **off** (on by default) | it re-opens the device when frames stop. On the card that is right — a wedged USB link recovers by itself. On the loopback frames stop every time the viewer quits, and a loopback with no writer has gone back to being an *output* device, so the re-open fails and the source is dead until you touch it by hand. Off, OBS keeps its handle and the picture returns on its own |
+
+The `standard` value is still written but the loopback ignores it: v4l2loopback
+implements no `VIDIOC_*_STD` ioctls, so OBS skips setting it. The input number
+and the TV standard are read from the *card*, not the loopback, which has
+neither.
+
+Everything else — pixel format, colour range, buffering, Yadif 2x, the 960x720
+stretched canvas, the 50fps canvas rate, the PipeWire audio source — is byte for
+byte what the direct profile gets.
+
+### Options
+
+`elgato-obs-setup --help` prints this same list.
+
+| option | |
+| ------ | --- |
+| `--name NAME` | name for both the profile and the scene collection (default `Elgato`) |
+| `--native` / `--flatpak` | which OBS to write to (default: whichever is installed and configured) |
+| `--share` | point the source at `/dev/elgato-share` — see above |
+| `-d`, `--device PATH` | V4L2 node (default `/dev/elgato`, or `/dev/elgato-share` with `--share`) |
+| `-i`, `--input WHICH` | `composite` \| `svideo` (default: leave the card alone) |
+| `--pal` / `--ntsc` | force the TV standard (default: whatever the card is set to) |
+| `--canvas WxH` | canvas and output size (default 960x720, 4:3) |
+| `--fps N` | canvas frame rate: 25, 50, 29.97 or 59.94 (default: 50 for PAL, 59.94 for NTSC) |
+| `--deinterlace M` | `yadif2x` (default) \| `yadif` \| `linear2x` \| `linear` \| `blend` \| `discard` \| `none` |
+| `--field top\|bottom` | field order (default `top`) |
+| `--sharp` | nearest-neighbour scaling |
+| `--buffering` | let the V4L2 source buffer frames — smoother under load, more latency |
+| `--no-audio` | do not add the audio source |
+| `--audio-device NODE` | PipeWire/PulseAudio source to capture (default: autodetect the Elgato node) |
+| `--recordings DIR` | where OBS writes recordings (default `$(xdg-user-dir VIDEOS)/elgato`) |
+| `--no-activate` | write the files but do not select them in OBS |
+| `--force` | overwrite an existing profile or scene collection |
+| `-n`, `--dry-run` | print what would be written, write nothing |
+| `-h`, `--help` | this |
+
+`--dry-run` is the quickest way to see what any of the others does.
 
 ## Deinterlacing
 
@@ -244,4 +289,5 @@ moves.
 The flatpak needs `devices=all` (its default) to see `/dev/video*`, and the
 PipeWire socket for audio and for window capture. Both are in the default
 manifest; `flatpak info --show-permissions com.obsproject.Studio` confirms it.
-The `/dev/elgato` symlink is visible inside the sandbox.
+The `/dev/elgato` and `/dev/elgato-share` symlinks are both visible inside the
+sandbox, so `--share` needs no extra permission.

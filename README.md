@@ -6,10 +6,14 @@ camcorder — with low enough latency to play games on, and without the frame
 tearing the stock driver produces.
 
 ```
-./install.sh          # build + install the driver, rules and launchers
-elgato-viewer         # play
+./install.sh             # build + install the driver, rules and launchers
+elgato-viewer            # play
 elgato-viewer --verify   # prove the picture is clean
 ```
+
+`./install.sh --no-driver` skips building the kernel module (rules and
+launchers only) and `--no-share` skips v4l2loopback, which only `--share`
+needs; `ELGATO_SKIP_SHARE=1` does the same.
 
 > **This builds and loads an out-of-tree kernel module.** It is unsigned, so it
 > taints the kernel and will not load under Secure Boot without signing. The
@@ -85,7 +89,33 @@ With the video window focused:
 | `q` | quit |
 | `Esc` | close the help overlay, or quit |
 
-`--help` lists the command-line options.
+### Options
+
+`elgato-viewer --help` prints this same list.
+
+| option | |
+| ------ | --- |
+| `-i`, `--input WHICH` | `composite` (default) \| `svideo` \| `0` \| `1` |
+| `--pal` / `--ntsc` | force the TV standard (default: leave the card on whatever it is) |
+| `-f`, `--fullscreen` | start full screen |
+| `-s`, `--size WxH` | window size (default 960x720, 4:3) |
+| `--sharp` | nearest-neighbour scaling; crisp pixels, no blur |
+| `--deinterlace M` | `yadif` (default) \| `greedyh` \| `linear` \| `weave` \| `none` — see [Deinterlacing](#deinterlacing) |
+| `--no-audio` | do not start the audio loopback |
+| `--latency MS` | audio loopback latency (default 15) |
+| `--share [DEV]` | also publish on a v4l2loopback device (default `/dev/elgato-share`) so OBS can read it too |
+| `--record FILE` | also write the raw captured frames to `FILE`, about 21 MB/s |
+| `--reset` | power-cycle the capture box first (runs `elgato-reset`) |
+| `--check` | run the pre-flight checks and exit — add `--share` to check that path too |
+| `--verify [SECS]` | measure frame integrity and exit (default 6s) |
+| `--quality [SECS]` | measure picture quality — crosstalk, sharpness, detail, noise (default 8s) |
+| `--tune` | sweep the driver's `elgato_*` knobs and score each. Needs root |
+| `-d`, `--device PATH` | V4L2 node (default: autodetect, preferring `/dev/elgato`) |
+| `-h`, `--help` | this |
+
+`--verify` and `--quality` answer different questions: integrity is whether the
+driver assembled the frame correctly, quality is what the picture looks like
+once it did.
 
 ### With OBS
 
@@ -156,6 +186,35 @@ yadif costs 5 ms, not the frame it is often assumed to. Press `c` while playing
 to cycle the three and judge for yourself — the difference is a motion artefact
 and barely visible in a screenshot.
 
+## The other tools
+
+`elgato-viewer` and `elgato-obs-setup` take options; the rest take verbs.
+`elgato-doctor` and `elgato-reset` take nothing at all.
+
+```
+elgato-audio start|stop|restart|status      # the pw-loopback that carries the sound
+elgato-audio mute|unmute|mute-toggle        # what the viewer's m key calls
+
+elgato-driver local [param=value ...]       # insmod the locally built module, this boot only
+elgato-driver stock                         # back to the distro module, immediately
+elgato-driver status                        # which one is loaded, by srcversion
+
+elgato-doctor                               # end-to-end diagnostics
+elgato-reset                                # power-cycle a wedged capture chip
+```
+
+`elgato-viewer` starts and stops the audio loopback for you; you only need
+`elgato-audio` directly to clear a stray one, or to check what is running.
+
+Four environment variables override defaults:
+
+| variable | |
+| -------- | --- |
+| `ELGATO_VIEWER_SINK` | force a GStreamer video sink instead of autodetecting one |
+| `ELGATO_AUDIO_LATENCY_MS` | audio loopback latency, same as `--latency` (default 15) |
+| `ELGATO_SETTLE` | seconds to wait after touching the hardware (default 0.8) |
+| `ELGATO_SKIP_SHARE` | set to 1 to make `install.sh` skip v4l2loopback, same as `--no-share` |
+
 ## Measuring
 
 **Do not judge this device by frame rate or dropped-frame counts.** Corrupt
@@ -185,6 +244,20 @@ It also refuses to pass judgement when the input is black: a disconnected or
 powered-off source has perfectly coherent chroma and would otherwise score a
 clean 0%.
 
+To try a driver change without installing it, `elgato-driver local` inserts the
+freshly built `driver/cx231xx/*.ko` with `insmod` for this boot only — nothing
+goes into `/lib/modules`, so a reboot (or `elgato-driver stock`) puts the distro
+module back. Module parameters are passed straight through, which is what makes
+an edit-build-measure loop quick:
+
+```
+make -C /lib/modules/$(uname -r)/build M=$PWD/driver/cx231xx modules
+elgato-driver local elgato_htl=2   # load it, this boot only
+elgato-viewer --verify             # score it
+elgato-driver status               # local build or distro? compares srcversion
+elgato-driver stock                # back to the distro module
+```
+
 The register constants in `driver/` are specific to this board and are not the
 chip's power-on defaults or documented in the cx25840 datasheet. Do not take
 them on trust — `--tune` applies each one and scores it, so every claim in this
@@ -206,6 +279,7 @@ Run `elgato-doctor` first; it checks the whole chain and says which link failed.
 | frames but no picture | check the yellow RCA at both ends, and `--ntsc`/`--pal` |
 | captured audio in voice chat | WirePlumber rule missing — re-run `install.sh` |
 | garbled or doubled audio | stray loopbacks — `elgato-audio stop` |
+| `--share` will not start, or OBS shows nothing | `elgato-doctor` has a Sharing section; the failure modes are listed in [OBS.md](OBS.md) |
 
 This box wedges its USB link readily (`-EPROTO` on control transfers). Once it
 does, everything above it looks broken and only a power cycle clears it;
@@ -246,9 +320,12 @@ and a Wayland or X11 sink), PipeWire with `pw-loopback`, and `python3` for
 `--verify`. The module is unsigned, so it taints the kernel and will not load
 under Secure Boot without signing.
 
-`--share` additionally needs `v4l2loopback` (`v4l2loopback-dkms` and
-`v4l2loopback-utils` on Arch); `install.sh` offers to install and configure it,
+`--share` additionally needs the `v4l2loopback` module (`v4l2loopback-dkms` on
+Arch, which pulls in `dkms`); `install.sh` offers to install and configure it,
 and `install.sh --no-share` skips it. Nothing else depends on it.
+`v4l2loopback-utils` is installed alongside but is not required — it only adds
+inspection tools such as `v4l2loopback-ctl query`. Note that DKMS rebuilds the
+module against each new kernel only if that kernel's headers are installed.
 
 ## Removing it
 
@@ -257,8 +334,13 @@ and `install.sh --no-share` skips it. Nothing else depends on it.
 ./uninstall.sh --keep-driver   # rules and launchers only
 ```
 
+`-y` / `--yes` skips the confirmation prompt.
+
 Nothing inside this directory is modified or deleted. Removing the patched
-driver brings the tearing back — the stock module has no `elgato_htl`.
+driver brings the tearing back — the stock module has no `elgato_htl`. The
+v4l2loopback configuration is removed and the module unloaded, but the
+`v4l2loopback-dkms` package itself is left alone: pacman owns it and other
+software may be using it.
 
 ## Credits
 
