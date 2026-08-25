@@ -14,26 +14,78 @@ elgato-obs-setup      # with OBS closed
 obs                   # the profile and scene collection are already selected
 ```
 
-## The one rule
+## The one rule, and the way round it
 
-**Only one program at a time can own `/dev/elgato`.** V4L2 capture nodes are
-single-open, so `elgato-viewer` and an OBS V4L2 source cannot both run. This is
-not a bug to work around; it is how the device works.
+**Only one program at a time can own `/dev/elgato`.** `cx231xx` has a single
+buffer queue, so whichever program starts streaming first owns the card and the
+next one gets `EBUSY`. That is not a bug to work around; it is how the device
+works, and no amount of configuration changes it.
 
 | symptom | meaning |
 | ------- | ------- |
 | the OBS source is black, log says `Failed to open device` | something else has it |
 | `elgato-viewer` says `Device or resource busy` | OBS has it |
 
-Who is holding it: `fuser -v /dev/elgato`, or `elgato-doctor`, which names the
-process.
+Who is holding it: `elgato-doctor`, which names the process, or `fuser -v /dev/elgato`.
 
-Audio is the opposite: PipeWire hands the same capture stream to as many
+What the rule does **not** say is that only one program can see the picture.
+Capture it once and you can hand the frames to as many readers as you like:
+
+```
+elgato-viewer --share        # captures, and republishes on /dev/elgato-share
+elgato-obs-setup --share     # points OBS at that node instead of the card
+```
+
+`--share` tees the pipeline into a **v4l2loopback** device — a virtual camera
+that OBS, a browser, or anything else opens like an ordinary webcam, while the
+viewer keeps the card. `install.sh` sets the loopback up; `elgato-doctor` has a
+**Sharing** section that says whether it is there and who is using it.
+
+What goes down the loopback is what came off the card: 720x576, YUYV, still
+interlaced, still SMPTE 170M limited range — the frames are tapped ahead of the
+deinterlacer and nothing relabels them. A reader sees `Field: Interlaced` and
+GStreamer negotiates `interlace-mode=interleaved`, so both sides know what they
+are looking at and make their own choices: the viewer's `c` key still cycles
+deinterlacers, and OBS still does Yadif 2x onto a 960x720 canvas exactly as it
+did when it owned the card. None of the settings in the table below change.
+
+Pixel aspect is the one thing V4L2 cannot carry, and it never could — that is
+why the 4:3 canvas stretch does the anamorphic correction, sharing or not.
+
+Two things follow from the viewer being the one holding the card:
+
+* **Start the viewer first.** With nothing writing to it the loopback node is
+  an *output* device, not a camera, and OBS may not list it at all.
+* **Close the viewer and OBS goes black** — but not permanently. The profile
+  written by `elgato-obs-setup --share` turns OBS's `auto_reset` off, so OBS
+  keeps its handle on the node instead of trying to re-open a device that has
+  gone back to being an output, and the picture returns when the viewer does.
+
+Audio never had this problem. PipeWire hands the same capture stream to as many
 readers as ask for it, so `elgato-audio`'s loopback, OBS and anything else can
-all have the sound at once. That is exactly why `elgato-audio` uses
-`pw-loopback` instead of pulling audio into a pipeline.
+all have the sound at once, sharing or not. That is exactly why `elgato-audio`
+uses `pw-loopback` instead of pulling audio into a pipeline.
 
-## Two ways to work
+## Three ways to work
+
+### Both at once
+
+For playing a game while streaming it, with the lowest latency on the hand that
+is holding the controller.
+
+```
+elgato-viewer --share        # start this first
+elgato-obs-setup --share     # once, with OBS closed
+obs
+```
+
+You watch the viewer's window, which is as direct as this card gets; OBS reads
+the same frames off `/dev/elgato-share` and can take its time compositing them.
+Neither one is a screen grab of the other, and neither is waiting on the other's
+clock.
+
+The cost is one extra copy of every frame — about 21 MB/s of memory bandwidth,
+which is nothing — and the ordering rule above.
 
 ### OBS owns the device
 
@@ -49,11 +101,18 @@ playing.
 
 ### The viewer owns the device
 
-For playing a game while recording it. Run `elgato-viewer` as usual and capture
-its window in OBS with **Window Capture (PipeWire)** — the `linux-pipewire`
-plugin, via the desktop portal. You keep the viewer's latency for the hand on
-the controller; the extra compositor round trip lands in the recording, where
-nobody is waiting on it.
+The fallback for the same job as **Both at once**, when v4l2loopback is not
+available — an unbuilt DKMS module after a kernel upgrade, a distribution that
+does not package it. Run `elgato-viewer` as usual and capture its *window* in
+OBS with **Window Capture (PipeWire)** — the `linux-pipewire` plugin, via the
+desktop portal. You keep the viewer's latency for the hand on the controller;
+the extra compositor round trip lands in the recording, where nobody is waiting
+on it.
+
+What OBS gets here is a screen grab, so it inherits whatever the viewer already
+did to the picture — deinterlaced, scaled to the window, resampled by the
+compositor. `--share` avoids all of that by handing over the frames themselves,
+which is why it is the better route when it is available.
 
 Audio still comes from the PipeWire capture node, exactly as in the other
 route. Do not also capture Desktop Audio — see below.
@@ -166,6 +225,11 @@ Output** to Advanced; nothing else in the setup depends on it.
 | audio doubled or echoing | Desktop Audio is capturing the loopback, or OBS monitoring is on as well as the loopback, or there are stray loopbacks (`elgato-audio stop`) |
 | no Elgato source in the audio list | the loopback or the card is gone — `elgato-doctor` |
 | the settings vanished | OBS was running when `elgato-obs-setup` wrote them |
+| sharing: no `/dev/elgato-share` | v4l2loopback is not loaded — `elgato-doctor`, then `sudo modprobe v4l2loopback` |
+| sharing: OBS does not list the share node | nothing is writing to it yet — start `elgato-viewer --share` first |
+| sharing: `elgato-viewer` says the share device is already being written to | another producer has it; the message names the process |
+| sharing: `is not a output device`, nothing is using the node | something set `keep_format` on it (`v4l2loopback-ctl set-caps` does). `elgato-viewer --share` now clears it for you; by hand it is `v4l2-ctl -d /dev/elgato-share --set-ctrl keep_format=0` |
+| sharing: OBS loses the source for good when the viewer stops | the profile predates `--share` — re-run `elgato-obs-setup --share --force` to get `auto_reset` off |
 
 **Opening Properties on the video source is not free.** OBS's device dropdown
 enumerates `/dev/videoN` only, so it cannot show `/dev/elgato` as the selected

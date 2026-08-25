@@ -37,6 +37,9 @@ SELF_DIR=$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd)
 
 USB_ID="0fd9:0037"
 CARD_NAME="Elgato Video Capture"
+# The v4l2loopback node --share publishes on. Must match card_label in
+# etc/modprobe.d/v4l2loopback-elgato.conf.
+SHARE_CARD_NAME="Elgato Share"
 
 # ---------------------------------------------------------------- output ----
 if [[ -t 2 ]]; then
@@ -86,6 +89,14 @@ Play the Elgato Video Capture full-screen-able, low latency, with sound.
                         analysed afterwards -- only one program can open the
                         device at a time, so this is how to do both at once.
                         Raw YUYV is about 21 MB/s; keep recordings short.
+      --share [DEV]     also publish the captured frames on a v4l2loopback
+                        device (default /dev/elgato-share) so OBS or anything
+                        else can read them while you watch. Only one program
+                        can open the card, so this is how to feed two. The
+                        frames go out exactly as captured -- still interlaced,
+                        still 720x576 -- so each side deinterlaces its own way.
+                        Sound needs nothing: PipeWire already hands the capture
+                        audio to every reader that asks. See OBS.md.
       --quality [SECS]  measure picture quality -- crosstalk, sharpness,
                         detail and noise -- and exit (default 8s). Use it to
                         compare settings; --verify checks integrity instead.
@@ -127,6 +138,8 @@ VERIFY_SECS=6
 QUALITY=0
 QUALITY_SECS=8
 RECORD=""
+SHARE=0
+SHARE_DEV=""
 TUNE=0
 BEST_SPEC=""
 
@@ -149,6 +162,9 @@ while (( $# )); do
         --check)          CHECK_ONLY=1; shift ;;
         --tune)           TUNE=1; shift ;;
         --record)         need "$@"; RECORD=$2; shift 2 ;;
+        --share)          SHARE=1
+                          if [[ ${2:-} == /dev/* ]]; then SHARE_DEV=$2; shift; fi
+                          shift ;;
         --quality)        QUALITY=1
                           if [[ ${2:-} =~ ^[0-9]+$ ]]; then QUALITY_SECS=$2; shift; fi
                           shift ;;
@@ -208,6 +224,112 @@ find_device() {
 }
 
 device_present() { lsusb 2>/dev/null | grep -qi "$USB_ID"; }
+
+# The loopback node --share writes into. This mirrors find_device above rather
+# than sharing it, because the capability test has to be inverted: with
+# exclusive_caps=1 a v4l2loopback node that nobody is writing to yet advertises
+# Video *Output*, not Video Capture, so find_device's filter would reject the
+# very node we are looking for. It only becomes a camera once we attach.
+find_share_device() {
+    local d caps
+    if [[ -c /dev/elgato-share ]]; then
+        echo /dev/elgato-share
+        return 0
+    fi
+    for d in /dev/video*; do
+        [[ -c $d ]] || continue
+        v4l2-ctl -d "$d" --info 2>/dev/null | grep -q "$SHARE_CARD_NAME" || continue
+        caps=$(v4l2-ctl -d "$d" --info 2>/dev/null | sed -n '/Device Caps/,$p')
+        [[ $caps == *"Video Output"* || $caps == *"Video Capture"* ]] || continue
+        echo "$d"
+        return 0
+    done
+    return 1
+}
+
+# Everything that has to be true before the pipeline can tee into the loopback.
+# Failing here with a specific instruction beats letting GStreamer report a
+# negotiation error thirty lines deep.
+share_preflight() {
+    if [[ -z $SHARE_DEV ]]; then
+        SHARE_DEV=$(find_share_device) || {
+            err "no v4l2loopback device found for --share"
+            if [[ -d /sys/module/v4l2loopback ]]; then
+                err "the module is loaded but has no '$SHARE_CARD_NAME' node --"
+                err "check /etc/modprobe.d/v4l2loopback-elgato.conf, then:"
+                err "    sudo modprobe -r v4l2loopback && sudo modprobe v4l2loopback"
+            else
+                err "load it with:  sudo modprobe v4l2loopback"
+                err "or set it up for good by re-running this repository's install.sh"
+            fi
+            return 1
+        }
+    fi
+
+    [[ -c $SHARE_DEV ]] || { err "$SHARE_DEV is not a character device"; return 1; }
+
+    # Refuse anything that is not a loopback. --share takes a path, and writing
+    # frames into somebody's actual webcam is not a mistake worth allowing.
+    if ! v4l2-ctl -d "$SHARE_DEV" --info 2>/dev/null | grep -q "v4l2 loopback"; then
+        err "$SHARE_DEV is not a v4l2loopback device -- refusing to write to it"
+        return 1
+    fi
+    [[ -w $SHARE_DEV ]] || {
+        err "$SHARE_DEV is not writable by you"
+        err "the udev rule tags it uaccess; try replugging or re-running install.sh"
+        return 1
+    }
+
+    # v4l2loopback takes one writer but any number of readers, and readers are
+    # the normal case -- OBS is configured to keep its handle open across
+    # restarts of this viewer, so an open fd on this node means nothing on its
+    # own. What matters is whether the output token is taken, and with
+    # exclusive_caps=1 that is exactly what the announced capability says: a
+    # node with a writer attached calls itself Video Capture, an idle one calls
+    # itself Video Output.
+    if v4l2-ctl -d "$SHARE_DEV" --info 2>/dev/null \
+        | sed -n '/Device Caps/,$p' | grep -q "Video Capture"; then
+        local holders
+        holders=$(share_holders "$SHARE_DEV")
+        err "$SHARE_DEV already has a writer${holders:+ -- open by: $holders}"
+        err "stop the other producer first; only one can publish at a time"
+        return 1
+    fi
+
+    # keep_format pins the node to announcing CAPTURE for ever (v4l2loopback.c:
+    # querycap only offers OUTPUT when the output token is free AND keep_format
+    # is clear), so no writer can attach and v4l2sink fails with the thoroughly
+    # unhelpful "is not a output device". "v4l2loopback-ctl set-caps" sets it,
+    # and it survives the process that set it. Clearing it is one unprivileged
+    # ioctl, so just do it rather than make somebody decode the error.
+    if [[ $(v4l2-ctl -d "$SHARE_DEV" --get-ctrl keep_format 2>/dev/null) == *": 1" ]]; then
+        v4l2-ctl -d "$SHARE_DEV" --set-ctrl keep_format=0 >/dev/null 2>&1 \
+            && msg "cleared keep_format on $SHARE_DEV (something had pinned it)" \
+            || { err "$SHARE_DEV is pinned by keep_format and it will not clear"
+                 err "reload the module:  sudo modprobe -r v4l2loopback && sudo modprobe v4l2loopback"
+                 return 1; }
+    fi
+
+    # No format is pinned here on purpose. v4l2loopback-ctl set-caps needs root,
+    # and it works by setting exactly the keep_format flag cleared above.
+    return 0
+}
+
+# Who holds a device, by name, without pulling in psmisc for fuser.
+share_holders() {
+    local dev=$1 target fd out="" names=""
+    target=$(readlink -f "$dev")
+    for fd in /proc/[0-9]*/fd/*; do
+        [[ $(readlink -f "$fd" 2>/dev/null) == "$target" ]] || continue
+        local pid=${fd#/proc/}; pid=${pid%%/*}
+        [[ $pid == "$$" ]] && continue
+        # one process can hold several fds on the same node; name it once
+        [[ " $out " == *" $pid "* ]] && continue
+        out+="$pid "
+        names+="$(cat "/proc/$pid/comm" 2>/dev/null)($pid) "
+    done
+    echo "${names% }"
+}
 
 # Count control-transfer failures since the box last enumerated. This hardware
 # wedges its USB link fairly readily; once it has, every symptom above it is a
@@ -860,6 +982,20 @@ settle
 
 preflight "$DEVICE" || exit 1
 
+# Correct the sample aspect on the way out. 720x576 and 720x480 are both 4:3
+# pictures made of non-square samples; scaling them to a square-pixel window
+# without saying so gives you a subtly stretched image.
+FMT_H=$(v4l2-ctl -d "$DEVICE" --get-fmt-video 2>/dev/null \
+        | sed -n 's|.*Width/Height *: *[0-9]*/\([0-9]*\).*|\1|p')
+case "${FMT_H:-576}" in
+    480) SRC_PAR="8/9"  ; CAP_H=480; CAP_FPS="30000/1001" ;;   # NTSC
+    *)   SRC_PAR="16/15"; CAP_H=576; CAP_FPS="25/1"       ;;   # PAL
+esac
+# The card only ever samples 720 across, in either standard.
+CAP_W=720
+
+(( SHARE )) && { share_preflight || exit 1; }
+
 if (( TUNE )); then
     tune_sweep
     exit $?
@@ -878,18 +1014,9 @@ fi
 if (( CHECK_ONLY )); then
     cur_std=$(v4l2-ctl -d "$DEVICE" --get-standard 2>/dev/null | tail -1 | tr -d '\t')
     msg "Pre-flight passed (${cur_std:-standard unknown}) -- ready to play."
+    (( SHARE )) && msg "Sharing would publish on $SHARE_DEV."
     exit 0
 fi
-
-# Correct the sample aspect on the way out. 720x576 and 720x480 are both 4:3
-# pictures made of non-square samples; scaling them to a square-pixel window
-# without saying so gives you a subtly stretched image.
-FMT_H=$(v4l2-ctl -d "$DEVICE" --get-fmt-video 2>/dev/null \
-        | sed -n 's|.*Width/Height *: *[0-9]*/\([0-9]*\).*|\1|p')
-case "${FMT_H:-576}" in
-    480) SRC_PAR="8/9"  ;;   # NTSC
-    *)   SRC_PAR="16/15" ;;  # PAL
-esac
 
 case "$DEINTERLACE" in
     none)   DEINT="" ;;
@@ -899,21 +1026,49 @@ esac
 decide_player
 SINK=$(pick_sink)
 
-REC_BRANCH=""
+# Split the stream rather than opening the device twice -- V4L2 allows only one
+# client. Every tap hangs off one tee placed ahead of the deinterlacer, so what
+# leaves here is what the card delivered, not what this window is showing.
+# Each branch is leaky: a slow disk, or an OBS that is not reading, drops frames
+# rather than stalling the picture you are watching.
+TAPS=""
 if [[ -n $RECORD ]]; then
-    # Split the stream rather than opening the device twice -- V4L2 allows only
-    # one client. The recording branch is leaky so a slow disk drops frames
-    # instead of stalling the picture you are playing on.
-    REC_BRANCH="! tee name=rec
-    rec. ! queue max-size-buffers=12 leaky=downstream ! filesink location=$RECORD async=false
-    rec. "
+    TAPS+="tap. ! queue max-size-buffers=12 leaky=downstream ! filesink location=$RECORD async=false
+    "
     msg "Recording raw frames to $RECORD (~21 MB/s)"
 fi
+if (( SHARE )); then
+    # The PAR has to go back to 1/1 here. v4l2sink advertises
+    # pixel-aspect-ratio=(fraction)1/1 and nothing else, so handing it the
+    # capssetter's 16/15 fails negotiation outright -- "streaming stopped,
+    # reason not-negotiated". Nothing is lost by relabelling: V4L2 has no field
+    # for pixel aspect, so it could never have crossed the loopback anyway.
+    # That is why consumers do the 4:3 correction themselves, exactly as they
+    # already do when they open the card directly.
+    #
+    # The interlacing is NOT relabelled. v4l2loopback stores the field it is
+    # given -- measured: readers see "Field: Interlaced" and GStreamer
+    # negotiates interlace-mode=interleaved -- so consumers are told the truth
+    # and deinterlace properly instead of guessing.
+    #
+    # async=false matters: a second sink that never prerolls would hold the
+    # whole pipeline in PAUSED and the window would stay black. sync=false for
+    # the same reason the display sink has it -- the card is the clock.
+    TAPS+="tap. ! queue max-size-buffers=4 leaky=downstream
+        ! capssetter caps=video/x-raw,pixel-aspect-ratio=(fraction)1/1
+        ! v4l2sink device=$SHARE_DEV sync=false async=false io-mode=mmap
+    "
+    msg "Sharing the capture on $SHARE_DEV -- point OBS at it (audio needs nothing)"
+fi
+
+TAP=""
+[[ -n $TAPS ]] && TAP="! tee name=tap
+    ${TAPS}tap. "
 
 PIPELINE="v4l2src device=$DEVICE io-mode=mmap
     ! queue max-size-buffers=3 max-size-bytes=0 max-size-time=0 leaky=downstream
     ! capssetter caps=video/x-raw,pixel-aspect-ratio=(fraction)$SRC_PAR
-    $REC_BRANCH! ${DEINT}videoconvert
+    $TAP! ${DEINT}videoconvert
     ! videoscale method=$SCALE_METHOD
     ! capsfilter name=outcaps caps=video/x-raw,width=$OUT_W,height=$OUT_H,pixel-aspect-ratio=(fraction)1/1
     ! $SINK"

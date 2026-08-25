@@ -50,10 +50,11 @@ bin/elgato-audio    audio loopback (pw-loopback); elgato-viewer starts it
 bin/elgato-doctor   end-to-end diagnostics
 bin/elgato-reset    power-cycle a wedged capture chip
 bin/elgato-obs-setup  write an OBS profile and scene collection for the card
-lib/                shared helpers for the three elgato-* helper scripts
+bin/elgato-driver   load the locally built module for this boot only
+lib/                shared helpers for the elgato-* helper scripts
 driver/cx231xx/     patched cx231xx source
 driver/patches/     every deviation from the stock kernel tree, with rationale
-etc/                udev, modprobe and WirePlumber configuration
+etc/                udev, modprobe, modules-load and WirePlumber configuration
 LICENSE             GPL-2.0-or-later, full text
 OBS.md              using OBS with this card, and alongside elgato-viewer
 ```
@@ -67,6 +68,7 @@ elgato-viewer --deinterlace linear # lowest latency, at the cost of combing
 elgato-viewer --ntsc               # or --pal
 elgato-viewer --input svideo
 elgato-viewer --reset              # power-cycle first
+elgato-viewer --share              # also publish to OBS (see below)
 ```
 
 ### Keys
@@ -90,9 +92,28 @@ With the video window focused:
 `elgato-obs-setup` writes an OBS profile and scene collection with the settings
 this card needs — the TV standard, the anamorphic 4:3 correction, 2x
 deinterlacing at 50fps, and audio taken from PipeWire rather than the raw ALSA
-device. Only one program can own the capture node at a time, so OBS and
-`elgato-viewer` cannot both hold it; [OBS.md](OBS.md) explains the ways round
-that and why each setting is what it is.
+device.
+
+Only one program can own the capture node at a time — `cx231xx` has a single
+buffer queue — but that does not have to mean choosing between OBS and the
+viewer:
+
+```
+elgato-viewer --share        # captures, and republishes on /dev/elgato-share
+elgato-obs-setup --share     # once, with OBS closed
+```
+
+`--share` tees the pipeline into a v4l2loopback device, so OBS reads the frames
+as an ordinary camera while the viewer keeps the card. They go out exactly as
+captured — still interlaced, still 720x576 — so each side deinterlaces and
+scales its own way, and nothing about the OBS settings changes. Start the viewer
+first: with nothing writing to it the node is not yet a camera.
+
+Sound needed none of this. PipeWire already hands the capture audio to every
+reader that asks, which is why `elgato-audio` uses `pw-loopback`.
+
+[OBS.md](OBS.md) explains all three ways to work and why each setting is what it
+is.
 
 Keys need `python-gobject`, `gtk4` and `gst-plugin-gtk4`. Without them the viewer
 still plays, but there is nothing to press: `gst-launch-1.0` has no keyboard
@@ -224,6 +245,10 @@ Kernel headers for the running kernel, `v4l-utils`, GStreamer (`base`, `good`
 and a Wayland or X11 sink), PipeWire with `pw-loopback`, and `python3` for
 `--verify`. The module is unsigned, so it taints the kernel and will not load
 under Secure Boot without signing.
+
+`--share` additionally needs `v4l2loopback` (`v4l2loopback-dkms` and
+`v4l2loopback-utils` on Arch); `install.sh` offers to install and configure it,
+and `install.sh --no-share` skips it. Nothing else depends on it.
 
 ## Removing it
 

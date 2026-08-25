@@ -1,0 +1,9 @@
+# Stable /dev/elgato-share for the v4l2loopback node that "elgato-viewer
+# --share" writes to. Kept separate from 70-elgato-video-capture.rules, which is
+# specifically about the USB device 0fd9:0037, so the sharing half can be
+# installed and removed on its own.
+#
+# v4l2loopback publishes its card_label as the sysfs "name" attribute, so
+# matching on it survives the device number moving.
+SUBSYSTEM=="video4linux", KERNEL=="video[0-9]*", ATTR{name}=="Elgato Share", \
+  SYMLINK+="elgato-share", TAG+="uaccess"

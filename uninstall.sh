@@ -3,8 +3,13 @@
 # Copyright (C) 2026 Hypnotize
 # Remove everything install.sh put on the system.
 #
-# Reverses all five pieces: the launcher symlinks, the WirePlumber rule, the
-# udev rule, /etc/modprobe.d/cx231xx.conf and the patched kernel module.
+# Reverses all six pieces: the launcher symlinks, the WirePlumber rule, the
+# udev rules, the v4l2loopback config, /etc/modprobe.d/cx231xx.conf and the
+# patched kernel module.
+#
+# The v4l2loopback *packages* are left installed -- pacman owns them, other
+# software may be using them, and removing them is your call, not this
+# script's. Only the configuration this package wrote is removed.
 #
 # Note what removing the module means: the stock in-tree cx231xx has no
 # elgato_htl knob, so the decoder's horizontal lock goes unprogrammed and the
@@ -18,11 +23,15 @@ set -uo pipefail
 SELF_DIR=$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd)
 KVER=$(uname -r)
 MOD_DIR="/lib/modules/$KVER/updates/cx231xx"
-TOOLS=(elgato-viewer elgato-audio elgato-doctor elgato-reset elgato-obs-setup)
+TOOLS=(elgato-viewer elgato-audio elgato-doctor elgato-reset elgato-obs-setup
+       elgato-driver)
 BIN_DIR="$HOME/.local/bin"
 WP_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/wireplumber/wireplumber.conf.d/51-elgato-not-default.conf"
 UDEV_RULE=/etc/udev/rules.d/70-elgato-video-capture.rules
 MODPROBE_CONF=/etc/modprobe.d/cx231xx.conf
+SHARE_UDEV_RULE=/etc/udev/rules.d/71-elgato-share.rules
+SHARE_MODPROBE=/etc/modprobe.d/v4l2loopback-elgato.conf
+SHARE_MODLOAD=/etc/modules-load.d/v4l2loopback-elgato.conf
 
 if [[ -t 1 ]]; then
     G=$'\033[1;32m'; Y=$'\033[1;33m'; R=$'\033[1;31m'; O=$'\033[0m'
@@ -117,7 +126,27 @@ if [[ -f $UDEV_RULE ]]; then
     sudo udevadm trigger --subsystem-match=video4linux --subsystem-match=usb
 fi
 
-# --- 4. driver and its options ----------------------------------------------
+# --- 4. the sharing loopback ------------------------------------------------
+# Only our configuration goes. The module and its packages stay: they are
+# ordinary system software that other things may be using.
+SHARE_REMOVED=0
+for f in "$SHARE_UDEV_RULE" "$SHARE_MODPROBE" "$SHARE_MODLOAD"; do
+    [[ -f $f ]] || continue
+    sudo rm -f "$f" && msg "removed $f" && SHARE_REMOVED=1
+done
+if (( SHARE_REMOVED )); then
+    sudo udevadm control --reload-rules
+    sudo udevadm trigger --subsystem-match=video4linux
+    if [[ -d /sys/module/v4l2loopback ]]; then
+        sudo modprobe -r v4l2loopback 2>/dev/null \
+            && msg "unloaded v4l2loopback" \
+            || warn "v4l2loopback is in use; it will be gone after a reboot"
+    fi
+    msg "left the v4l2loopback packages installed -- remove them yourself if"
+    msg "nothing else wants them:  sudo pacman -Rns v4l2loopback-dkms v4l2loopback-utils"
+fi
+
+# --- 5. driver and its options ----------------------------------------------
 if (( KEEP_DRIVER )); then
     msg "Left the patched driver and $MODPROBE_CONF in place (--keep-driver)"
 else

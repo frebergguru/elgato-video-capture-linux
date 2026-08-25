@@ -20,13 +20,18 @@
 #  * 50 fields per second become 50 real frames per second with a 2x
 #    deinterlacer, but only if the canvas also runs at 50fps.
 #  * The audio has to come from PipeWire, not ALSA. Only one client may open
-#    the raw ALSA device, and elgato-audio's loopback already has it.
+#    the raw ALSA device, and elgato-audio's loopback already has it. PipeWire
+#    then fans that stream out to everyone, which is why sound needs no
+#    sharing trick while the picture does.
 #
 # All of this is plain files on disk. OBS reads them at startup and rewrites
 # them at exit, so it must not be running while this writes.
 #
-# See OBS.md for what to do with the result, and for the one rule that governs
-# everything: only one program at a time can own /dev/elgato.
+# See OBS.md for what to do with the result. The card itself is single-open --
+# cx231xx has one buffer queue, so whoever starts streaming first owns it -- but
+# that no longer forces a choice between OBS and the viewer: run
+# "elgato-viewer --share" and pass --share here, and OBS reads the loopback the
+# viewer republishes on while the viewer keeps the card.
 
 set -uo pipefail
 
@@ -41,6 +46,7 @@ MAIN_CANVAS_UUID="6c69626f-6273-4c00-9d88-c5136d61696e"
 NAME="Elgato"
 FLAVOUR=""              # native | flatpak | "" = detect
 DEVICE=""               # "" = detect, prefers the /dev/elgato symlink
+SHARE=0                 # 1 = point OBS at the v4l2loopback node instead
 INPUT=""                # composite | svideo; "" = whatever the card is on
 STANDARD=""             # pal | ntsc;         "" = whatever the card is on
 CANVAS=""               # WxH; "" = 960x720
@@ -71,6 +77,9 @@ discard this.
                       (default: whichever is installed and configured)
 
   -d, --device PATH   V4L2 node (default: /dev/elgato, the udev symlink)
+      --share         point OBS at /dev/elgato-share, the v4l2loopback node
+                      "elgato-viewer --share" publishes on, so the viewer and
+                      OBS can both have the picture. Start the viewer first.
   -i, --input WHICH   composite | svideo   (default: leave the card alone)
       --pal           force the PAL standard
       --ntsc          force the NTSC standard
@@ -107,6 +116,7 @@ while (( $# )); do
         --native)       FLAVOUR=native; shift ;;
         --flatpak)      FLAVOUR=flatpak; shift ;;
         -d|--device)    DEVICE=$2; shift 2 ;;
+        --share)        SHARE=1; shift ;;
         -i|--input)     INPUT=$2; shift 2 ;;
         --pal)          STANDARD=pal; shift ;;
         --ntsc)         STANDARD=ntsc; shift ;;
@@ -201,6 +211,9 @@ fi
 # the video node number moves when the built-in webcam re-enumerates. The cost
 # is that OBS's own device dropdown lists /dev/videoN only, so the Properties
 # dialog will not show this path selected -- see OBS.md.
+if (( SHARE )) && [[ -z $DEVICE ]]; then
+    DEVICE=/dev/elgato-share
+fi
 if [[ -z $DEVICE ]]; then
     if [[ -c /dev/elgato ]]; then
         DEVICE=/dev/elgato
@@ -212,6 +225,23 @@ fi
 [[ -n $DEVICE ]] || die "no Elgato Video Capture found and no --device given"
 [[ -c $DEVICE ]] || warn "$DEVICE is not a character device right now"
 
+# Which node OBS opens and which node we ask about are not always the same. A
+# v4l2loopback node has no video input and no TV standard -- it is a pipe, not a
+# tuner -- so when OBS is pointed at the share, the input number and standard
+# still have to be read off the card itself.
+PROBE=$DEVICE
+if [[ $DEVICE == "$SHARE_DEV_DEFAULT" ]] || (( SHARE )); then
+    SHARE=1
+    PROBE=$(find_device) || PROBE=""
+    if [[ -z $PROBE ]]; then
+        warn "the card is not present; falling back to defaults for input and standard"
+    fi
+    if [[ ! -c $DEVICE ]]; then
+        warn "$DEVICE does not exist yet -- load v4l2loopback (see install.sh),"
+        warn "then start 'elgato-viewer --share' before OBS looks for a picture"
+    fi
+fi
+
 # Input and standard. Reading them off the card beats a default: whatever it is
 # set to is what the user last watched successfully.
 INPUT_NUM=0
@@ -221,8 +251,8 @@ if [[ -n $INPUT ]]; then
         svideo|1)    INPUT_NUM=1 ;;
         *) die "--input must be composite or svideo" ;;
     esac
-elif [[ -c $DEVICE ]]; then
-    INPUT_NUM=$(v4l2-ctl -d "$DEVICE" --get-input 2>/dev/null | grep -oE '[0-9]+' | head -1)
+elif [[ -c $PROBE ]]; then
+    INPUT_NUM=$(v4l2-ctl -d "$PROBE" --get-input 2>/dev/null | grep -oE '[0-9]+' | head -1)
     [[ -n $INPUT_NUM ]] || INPUT_NUM=0
 fi
 
@@ -236,8 +266,8 @@ case $STANDARD in
     ntsc) STD_ID=$STD_NTSC ;;
     "")
         STD_ID=""
-        if [[ -c $DEVICE ]]; then
-            std_hex=$(v4l2-ctl -d "$DEVICE" --get-standard 2>/dev/null | grep -oE '0x[0-9a-fA-F]+' | head -1)
+        if [[ -c $PROBE ]]; then
+            std_hex=$(v4l2-ctl -d "$PROBE" --get-standard 2>/dev/null | grep -oE '0x[0-9a-fA-F]+' | head -1)
             [[ -n $std_hex ]] && STD_ID=$(( std_hex ))
         fi
         [[ -n $STD_ID && $STD_ID -gt 0 ]] || STD_ID=$STD_PAL
@@ -312,6 +342,7 @@ PROFILE_FILE="$PROFILE_DIR/basic.ini"
 echo
 msg "OBS:        $FLAVOUR $OBS_VERSION  ($CFG)"
 msg "Device:     $DEVICE  input $INPUT_NUM  $STD_NAME (0x$(printf '%x' "$STD_ID"))"
+(( SHARE )) && msg "            (shared loopback; input and standard read from ${PROBE:-the card})"
 msg "Canvas:     ${CW}x${CH} @ ${FPS}fps, $DEINTERLACE ($FIELD_ORDER field first)"
 if (( WITH_AUDIO )); then
     msg "Audio:      $AUDIO_DEVICE"
@@ -337,6 +368,7 @@ fi
 build_scene_json() {
     OBS_NAME="$NAME" OBS_PREV_VER="$PREV_VER" OBS_CANVAS_UUID="$MAIN_CANVAS_UUID" \
     OBS_DEVICE="$DEVICE" OBS_INPUT="$INPUT_NUM" OBS_STD="$STD_ID" \
+    OBS_SHARE="$SHARE" \
     OBS_PIXFMT="$PIXELFORMAT" OBS_BUFFERING="$BUFFERING" \
     OBS_DEINT="$DEINT_MODE" OBS_FIELD="$FIELD_NUM" OBS_SCALE="$SCALE_FILTER" \
     OBS_CW="$CW" OBS_CH="$CH" \
@@ -380,6 +412,12 @@ def source(sname, sid, settings, **extra):
 # Resolution and framerate are -1, OBS's "Leave Unchanged". The card answers
 # VIDIOC_ENUM_FRAMESIZES with EINVAL, so there is nothing else to pick, and the
 # TV standard already determines 720x576 or 720x480.
+#
+# The loopback does implement ENUM_FRAMESIZES, so with --share the Properties
+# dialog finally shows real entries -- but -1 stays the right answer there too.
+# It follows whatever the viewer is publishing, so it is correct for PAL and
+# NTSC alike, and it keeps OBS from calling S_FMT on a device whose format
+# belongs to the writer.
 video = source(
     "Elgato Video Capture", "v4l2_input",
     {
@@ -393,7 +431,14 @@ video = source(
         # crushed-blacks, blown-highlights mistake.
         "color_range": "partial",
         "buffering": os.environ["OBS_BUFFERING"] == "1",
-        "auto_reset": True,
+        # auto_reset re-opens the device when frames stop arriving. On the card
+        # that is what you want -- a wedged USB link recovers by itself. On the
+        # share it is the opposite: frames stop every time the viewer quits, and
+        # a loopback with no writer announces itself as an OUTPUT device, so the
+        # re-open fails and the source is dead until you touch it by hand.
+        # Leaving it off makes OBS keep its handle and pick the picture back up
+        # when the viewer returns.
+        "auto_reset": os.environ["OBS_SHARE"] != "1",
         "timeout_frames": 5,
     },
     deinterlace_mode=int(os.environ["OBS_DEINT"]),
@@ -643,12 +688,21 @@ PY
 fi
 
 # ---------------------------------------------------------------- summary ----
+if (( SHARE )); then
+    SHARING_NOTE="  OBS reads the loopback, so elgato-viewer can run at the same time -- but it
+  is the viewer that fills it. Start 'elgato-viewer --share' first; with no
+  producer the node exists but stays black."
+else
+    SHARING_NOTE="  Nothing else may hold $DEVICE while OBS has it -- quit elgato-viewer first.
+  To watch and stream at once instead, run 'elgato-viewer --share' and re-run
+  this with --share. Audio is already shared either way."
+fi
+
 echo
 msg "Done. Start OBS and you should see the picture."
 echo
 cat >&2 <<EOF
-  Nothing else may hold $DEVICE while OBS has it -- quit elgato-viewer first.
-  To watch with low latency instead, use elgato-viewer and capture its window.
+$SHARING_NOTE
 
   In OBS:
     Preview is not a monitor -- right-click it, Fullscreen Projector (Preview),

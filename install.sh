@@ -3,13 +3,15 @@
 # Copyright (C) 2026 Hypnotize
 # Install the Elgato Video Capture V2 setup.
 #
-# Five pieces, in dependency order:
+# Six pieces, in dependency order:
 #
 #   1. the patched cx231xx driver, into /lib/modules/<kernel>/updates/
 #   2. /etc/modprobe.d/cx231xx.conf, which turns on elgato_htl=2
 #   3. the udev rule: a stable /dev/elgato, and USB autosuspend pinned off
 #   4. the WirePlumber rule, so the card never becomes your default microphone
-#   5. launcher symlinks in ~/.local/bin
+#   5. v4l2loopback, so "elgato-viewer --share" can hand the picture to OBS as
+#      well -- the card itself is single-open and always will be
+#   6. launcher symlinks in ~/.local/bin
 #
 # (1) and (2) are what make the picture usable. Without them roughly 60% of
 # frames tear: the stock driver never programs the decoder's horizontal
@@ -24,7 +26,8 @@ set -uo pipefail
 SELF_DIR=$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd)
 KVER=$(uname -r)
 MOD_DIR="/lib/modules/$KVER/updates/cx231xx"
-TOOLS=(elgato-viewer elgato-audio elgato-doctor elgato-reset elgato-obs-setup)
+TOOLS=(elgato-viewer elgato-audio elgato-doctor elgato-reset elgato-obs-setup
+       elgato-driver)
 
 if [[ -t 1 ]]; then
     G=$'\033[1;32m'; Y=$'\033[1;33m'; R=$'\033[1;31m'; O=$'\033[0m'
@@ -36,13 +39,17 @@ warn() { printf '%s!!%s %s\n' "$Y" "$O" "$*" >&2; }
 die()  { printf '%sxx%s %s\n' "$R" "$O" "$*" >&2; exit 1; }
 
 WITH_DRIVER=1
+WITH_SHARE=${ELGATO_SKIP_SHARE:+0}; WITH_SHARE=${WITH_SHARE:-1}
 while (( $# )); do
     case "$1" in
         --no-driver) WITH_DRIVER=0; shift ;;
+        --no-share)  WITH_SHARE=0;  shift ;;
         -h|--help)
             sed -n '/^# Install the/,/^set -uo/p' "$0" | sed 's/^# \{0,1\}//;$d'
-            echo "usage: ${0##*/} [--no-driver]"
+            echo "usage: ${0##*/} [--no-driver] [--no-share]"
             echo "  --no-driver   skip building and installing the kernel module"
+            echo "  --no-share    skip v4l2loopback (elgato-viewer --share will not work)"
+            echo "                same as setting ELGATO_SKIP_SHARE=1"
             exit 0 ;;
         *) die "unknown option: $1 (try --help)" ;;
     esac
@@ -123,7 +130,68 @@ mkdir -p "$WP_DIR"
 install -m644 "$SELF_DIR/etc/wireplumber/51-elgato-not-default.conf" "$WP_DIR/" \
     || warn "could not install the WirePlumber rule"
 
-# --- 5. launcher symlinks ---------------------------------------------------
+# --- 5. the sharing loopback ------------------------------------------------
+# The capture card is single-open: cx231xx has one vb2_queue, so whoever calls
+# STREAMON first owns it and everyone else gets EBUSY. v4l2loopback is how
+# "elgato-viewer --share" gets around that -- it captures once and republishes
+# the frames on a virtual node OBS can read. Audio never needed this; PipeWire
+# already hands the capture stream to every reader.
+#
+# Nothing here is fatal. This script exists to install the driver, and a missing
+# loopback must not take that down with it.
+if (( WITH_SHARE )); then
+    echo
+    if [[ -d /sys/module/v4l2loopback ]] || modinfo v4l2loopback >/dev/null 2>&1; then
+        msg "v4l2loopback is already available"
+    elif ! command -v pacman >/dev/null; then
+        warn "v4l2loopback is missing and this is not an Arch-based system."
+        warn "Install it your distribution's way, then re-run with --no-share."
+    else
+        msg "v4l2loopback is needed for 'elgato-viewer --share' (OBS and the"
+        msg "viewer at the same time). It builds against your kernel via DKMS."
+        read -r -p ":: Install dkms, v4l2loopback-dkms and v4l2loopback-utils? [Y/n] " reply
+        case "${reply,,}" in
+            n|no) WITH_SHARE=0; msg "Skipping -- re-run install.sh to add it later" ;;
+            *)    sudo pacman -S --needed dkms v4l2loopback-dkms v4l2loopback-utils \
+                      || { WITH_SHARE=0; warn "pacman failed; skipping the loopback"; } ;;
+        esac
+    fi
+fi
+
+if (( WITH_SHARE )); then
+    msg "Installing the v4l2loopback config (/dev/elgato-share)"
+    sudo install -m644 "$SELF_DIR/etc/modprobe.d/v4l2loopback-elgato.conf" \
+        /etc/modprobe.d/v4l2loopback-elgato.conf \
+        || warn "could not install the v4l2loopback modprobe config"
+    sudo install -Dm644 "$SELF_DIR/etc/modules-load.d/v4l2loopback-elgato.conf" \
+        /etc/modules-load.d/v4l2loopback-elgato.conf \
+        || warn "could not install the modules-load config; it will not load at boot"
+    if sudo install -m644 "$SELF_DIR/etc/71-elgato-share.rules" \
+            /etc/udev/rules.d/71-elgato-share.rules; then
+        sudo udevadm control --reload-rules
+        sudo udevadm trigger --subsystem-match=video4linux
+    else
+        warn "could not install the share udev rule; /dev/elgato-share will not appear"
+    fi
+
+    # Reload rather than modprobe: if it was already up with other options
+    # (another tool's, or an earlier version of this file) ours would be ignored.
+    sudo modprobe -r v4l2loopback 2>/dev/null
+    if sudo modprobe v4l2loopback; then
+        for _ in 1 2 3 4 5; do [[ -c /dev/elgato-share ]] && break; sleep 0.3; done
+        if [[ -c /dev/elgato-share ]]; then
+            msg "/dev/elgato-share is ready -- try: elgato-viewer --share"
+        else
+            warn "the module loaded but /dev/elgato-share did not appear."
+            warn "Check: v4l2-ctl --list-devices | grep -A1 'Elgato Share'"
+        fi
+    else
+        warn "modprobe v4l2loopback failed -- 'elgato-viewer --share' will not work"
+        warn "If DKMS has not built yet, try: sudo dkms autoinstall"
+    fi
+fi
+
+# --- 6. launcher symlinks ---------------------------------------------------
 BIN_DIR="$HOME/.local/bin"
 mkdir -p "$BIN_DIR"
 for tool in "${TOOLS[@]}"; do
@@ -135,7 +203,7 @@ case ":$PATH:" in
     *) warn "$BIN_DIR is not on your PATH -- add it to your shell rc" ;;
 esac
 
-# --- 6. load it -------------------------------------------------------------
+# --- 7. load it -------------------------------------------------------------
 if (( WITH_DRIVER )); then
     echo
     msg "Loading the driver"
@@ -151,7 +219,7 @@ if (( WITH_DRIVER )); then
     sleep 3
 fi
 
-# --- 7. verify --------------------------------------------------------------
+# --- 8. verify --------------------------------------------------------------
 echo
 HTL=/sys/module/cx231xx/parameters/elgato_htl
 if [[ -r $HTL ]]; then

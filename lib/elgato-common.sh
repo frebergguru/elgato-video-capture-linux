@@ -8,6 +8,13 @@ ELGATO_CARD_NAME="Elgato Video Capture V2"
 ELGATO_USB_ID="0fd9:0037"
 ELGATO_AUDIO_PATTERN="alsa_input.usb-Elgato_Video_Capture"
 
+# The v4l2loopback node "elgato-viewer --share" republishes the capture on, so
+# that OBS and the viewer can both have the picture. The card itself is
+# single-open and cannot be shared; this is the way around that. Must match
+# card_label in etc/modprobe.d/v4l2loopback-elgato.conf.
+SHARE_CARD_NAME="Elgato Share"
+SHARE_DEV_DEFAULT="/dev/elgato-share"
+
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/elgato"
 CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/elgato.conf"
 
@@ -36,6 +43,24 @@ find_device() {
         fi
     done
 
+    return 1
+}
+
+# The loopback node, if it is set up. Deliberately does not test for the Video
+# Capture capability the way find_device does: with exclusive_caps=1 a
+# v4l2loopback node advertises Video Output until something is writing to it,
+# and only then becomes a camera.
+find_share_device() {
+    if [[ -c $SHARE_DEV_DEFAULT ]]; then
+        echo "$SHARE_DEV_DEFAULT"; return 0
+    fi
+    local dev
+    for dev in /dev/video*; do
+        [[ -c $dev ]] || continue
+        if v4l2-ctl -d "$dev" --info 2>/dev/null | grep -F "$SHARE_CARD_NAME" >/dev/null; then
+            echo "$dev"; return 0
+        fi
+    done
     return 1
 }
 
