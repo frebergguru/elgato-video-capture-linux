@@ -120,11 +120,24 @@ route. Do not also capture Desktop Audio — see below.
 ### Neither
 
 ```
-elgato-viewer --record raw.yuv
+elgato-viewer          # then press r
 ```
-writes the raw captured frames while you play, for encoding afterwards. No OBS,
-no compositor, no encoder competing for the CPU. Raw YUYV is about 21 MB/s, so
-keep it short.
+No OBS, no compositor, no scene graph — press `r` and the viewer writes the
+recording itself, straight off the same tee `--share` publishes from. What you
+get is a Matroska file holding the frames exactly as the card delivered them:
+FFV1, lossless, still interlaced, with the capture audio muxed in. About 4.5
+MB/s on console output, more on noisy tape. `s` saves a single frame as a PNG.
+
+For archiving a tape this is the better route, not the fallback. OBS composites
+and re-encodes; this writes down what arrived and leaves every decision about
+deinterlacing and scaling to be made afterwards, once, without a clock running.
+What OBS is still better at is everything around the recording — scenes,
+overlays, a second source, streaming. See
+[Recording](README.md#recording) in the README for the formats and sizes.
+
+`elgato-viewer --record raw.yuv` is still there, and still writes headerless
+YUYV at about 21 MB/s. That is for feeding an analysis tool that wants raw
+frames, not for a file to keep.
 
 ## What the script writes
 
@@ -255,6 +268,11 @@ The profile records with x264 at the "High Quality" preset into MKV. SD
 material at 25 or 50fps needs very little bitrate — this is not where to spend
 effort. If you want a specific codec or hardware encoding, switch **Settings →
 Output** to Advanced; nothing else in the setup depends on it.
+
+Note that what OBS records here is the picture *after* it has been
+deinterlaced, scaled and composited. If the recording is the point and you want
+the frames as the card sent them, `elgato-viewer`'s `r` key writes them
+losslessly instead — see [Neither](#neither) above.
 
 ## If something is wrong
 

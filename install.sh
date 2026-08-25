@@ -66,6 +66,11 @@ for t in v4l2-ctl gst-launch-1.0 pw-loopback; do
     command -v "$t" >/dev/null || warn "$t is missing -- install v4l-utils / gstreamer / pipewire"
 done
 
+# Optional, and only for elgato-viewer's r key: the viewer plays perfectly
+# without them and says which one is missing if you press r.
+gst-inspect-1.0 avenc_ffv1 >/dev/null 2>&1 \
+    || warn "gst-libav is missing -- 'elgato-viewer' plays fine, but the r key cannot record"
+
 # Releasing the module needs whatever has the ALSA card open to let go. The
 # capture card registers an ALSA device, and WirePlumber holds its control
 # node, so an unload fails with "Module cx231xx_alsa is in use" until it stops.

@@ -73,6 +73,7 @@ elgato-viewer --ntsc               # or --pal
 elgato-viewer --input svideo
 elgato-viewer --reset              # power-cycle first
 elgato-viewer --share              # also publish to OBS (see below)
+elgato-viewer --record-codec h264  # r then records small files, not lossless
 ```
 
 ### Keys
@@ -85,6 +86,8 @@ With the video window focused:
 | `z` / `x` | smaller / larger window |
 | `c` | cycle the deinterlacer — yadif / greedyh / linear |
 | `m` | mute/unmute the capture audio — other apps keep playing |
+| `r` | start/stop recording — see [Recording](#recording) |
+| `s` | save a screenshot — a PNG in `~/elgato`, deinterlaced and 768x576 |
 | `h` | show the keys on screen |
 | `q` | quit |
 | `Esc` | close the help overlay, or quit |
@@ -104,7 +107,12 @@ With the video window focused:
 | `--no-audio` | do not start the audio loopback |
 | `--latency MS` | audio loopback latency (default 15) |
 | `--share [DEV]` | also publish on a v4l2loopback device (default `/dev/elgato-share`) so OBS can read it too |
-| `--record FILE` | also write the raw captured frames to `FILE`, about 21 MB/s |
+| `--record FILE` | also write the raw captured frames to `FILE`, about 21 MB/s — for analysis; for a file you can play, press `r` |
+| `--record-dir DIR` | where `r` writes recordings (default `~/elgato`, made on first use) |
+| `--shot-dir DIR` | where `s` writes screenshots (default `~/elgato`) |
+| `--record-codec C` | `ffv1` (default) \| `h264` — see [Recording](#recording) |
+| `--no-record-audio` | leave the capture audio out of recordings |
+| `--field-order F` | `top` (default) \| `bottom` — which field of a recorded frame comes first |
 | `--reset` | power-cycle the capture box first (runs `elgato-reset`) |
 | `--check` | run the pre-flight checks and exit — add `--share` to check that path too |
 | `--verify [SECS]` | measure frame integrity and exit (default 6s) |
@@ -116,6 +124,53 @@ With the video window focused:
 `--verify` and `--quality` answer different questions: integrity is whether the
 driver assembled the frame correctly, quality is what the picture looks like
 once it did.
+
+### Recording
+
+`r` starts and stops a recording; `s` writes a single frame. Both land in
+`~/elgato`, named for the time they were taken, and both can be pointed
+elsewhere with `--record-dir` / `--shot-dir`. The window shows `● REC 0:23`
+with the file size while a recording runs.
+
+Both tap the picture **ahead of the deinterlacer**, off the same tee `--share`
+uses, so what is written is what the card delivered — not what the window
+happens to be showing. Resizing the window, or cycling the deinterlacer with
+`c`, changes neither.
+
+A recording is a Matroska file, and by default it holds the frames exactly as
+they arrived:
+
+| | |
+| --- | --- |
+| video | FFV1, lossless, 720x576 still interlaced, 4:2:2 — bit-for-bit the capture |
+| audio | uncompressed PCM at the rate and channel count the card is actually sending |
+| size | 4.5 MB/s measured on console output — about 16 GB an hour. Noisy tape compresses worse; budget up to twice that |
+
+That is the format to archive a tape in: nothing is thrown away, and the
+deinterlacing can be decided later, once, with as much time as it takes. It
+costs about 0.65 of one core to encode — measured on 720x576 of pure noise,
+which is the worst thing this codec can be handed.
+
+Measured on a real capture: 48 seconds of NES output came to 1200 frames in
+47.99s — 25.005 fps, not a frame dropped — and 215 MB, with no USB errors
+logged while it ran.
+
+`--record-codec h264` is the other trade: the picture is deinterlaced to 50fps
+and encoded at quantizer 18, which is hard to fault by eye and about a
+twentieth of the size. Use it when the recording is something to watch rather
+than something to keep.
+
+MKV rather than MPG because `.mpg` means an MPEG-2 program stream — lossy,
+4:2:0, and unable to carry FFV1 at all.
+
+Screenshots are PNG: lossless, and written at 768x576 (640x480 on NTSC), which
+is the capture with its non-square samples corrected rather than the window
+scaled up. They are deinterlaced with whatever method `c` last selected, so a
+still matches what you were looking at.
+
+Recordings are finished properly when you quit — the window waits for the
+muxer to write its index, which is what the difference between a file with a
+duration and a truncated one comes down to. Measured at about 100ms.
 
 ### With OBS
 
@@ -319,6 +374,11 @@ Kernel headers for the running kernel, `v4l-utils`, GStreamer (`base`, `good`
 and a Wayland or X11 sink), PipeWire with `pw-loopback`, and `python3` for
 `--verify`. The module is unsigned, so it taints the kernel and will not load
 under Secure Boot without signing.
+
+The `r` key additionally needs `gst-libav`, for the FFV1 encoder, and
+`--record-codec h264` needs `gst-plugins-ugly` for x264. Neither is required
+to watch: without them everything else works and `r` says which package is
+missing. `s` needs nothing beyond `good`.
 
 `--share` additionally needs the `v4l2loopback` module (`v4l2loopback-dkms` on
 Arch, which pulls in `dkms`); `install.sh` offers to install and configure it,

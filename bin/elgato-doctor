@@ -202,6 +202,15 @@ command -v v4l2loopback-ctl >/dev/null \
     && info "v4l2loopback-utils present (v4l2loopback-ctl query /dev/elgato-share)" \
     || info "v4l2loopback-utils not installed (optional; only adds inspection tools)"
 
+# The encoders behind elgato-viewer's r key. Optional both: watching needs
+# neither, and the viewer names the missing package itself if you press r.
+gst-inspect-1.0 avenc_ffv1 >/dev/null 2>&1 \
+    && info "gst-libav present (the r key can record losslessly)" \
+    || note "gst-libav is not installed -- 'elgato-viewer' plays, but r cannot record"
+gst-inspect-1.0 x264enc >/dev/null 2>&1 \
+    && info "gst-plugins-ugly present (--record-codec h264 available)" \
+    || info "gst-plugins-ugly not installed (optional; only for --record-codec h264)"
+
 # Who holds the card itself. This is the usual cause of "OBS is black".
 CARD_DEV=$(find_device) || CARD_DEV=""
 if [[ -n $CARD_DEV ]]; then

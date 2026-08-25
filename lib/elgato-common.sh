@@ -284,6 +284,33 @@ for o in objs:
 ' "$ELGATO_AUDIO_PATTERN" 2>/dev/null
 }
 
+# The node's sample rate and channel count, as PipeWire reports them. Falls
+# back to what this card always is when a property is absent -- a suspended
+# node does not always publish its format, and a sane default beats no answer.
+audio_node_prop() {
+    pw-dump 2>/dev/null | python3 -c '
+import json, sys
+name, key, fallback = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    objs = json.load(sys.stdin)
+except Exception:
+    print(fallback); sys.exit(0)
+for o in objs:
+    if o.get("type") != "PipeWire:Interface:Node":
+        continue
+    props = (o.get("info") or {}).get("props") or {}
+    if props.get("node.name") == name:
+        value = str(props.get(key, "")).strip()
+        print(value if value.isdigit() else fallback)
+        break
+else:
+    print(fallback)
+' "$1" "$2" "$3" 2>/dev/null || echo "$3"
+}
+
+audio_node_rate()     { audio_node_prop "$1" audio.rate 48000; }
+audio_node_channels() { audio_node_prop "$1" audio.channels 2; }
+
 # what_feeds NODENAME -> names of the nodes actually linked into it
 what_feeds() {
     pw-dump 2>/dev/null | python3 -c '

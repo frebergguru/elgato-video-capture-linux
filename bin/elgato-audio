@@ -186,6 +186,23 @@ case "${1:-start}" in
     mute)        set_mute 1 ;;
     unmute)      set_mute 0 ;;
     mute-toggle) set_mute toggle ;;
+    # The capture source's PipeWire node, for anyone who wants to read the audio
+    # themselves rather than have it looped to the speakers -- the viewer's r
+    # key muxes it into its recording. Prints "NAME RATE CHANNELS" and nothing
+    # else, so a caller can read it straight into three variables.
+    #
+    # The rate and channel count are worth reporting rather than assuming. A
+    # GStreamer source left to negotiate freely against a flexible sink settles
+    # on its own defaults, not the device's -- measured: 44100 mono off a node
+    # that is 48000 stereo, i.e. a downsample and a lost channel, silently.
+    # This card is 48kHz, but it is stereo or mono depending on what is fed
+    # into it, so the channel count is read rather than guessed.
+    record-node)
+        node=$(find_audio_node)
+        [[ -n $node ]] || { warn "no Elgato audio source in PipeWire"; exit 1; }
+        printf '%s %s %s\n' "$node" "$(audio_node_rate "$node")" \
+                            "$(audio_node_channels "$node")"
+        ;;
     status)
         if is_running; then
             id=$(loopback_node_id)
@@ -198,5 +215,5 @@ case "${1:-start}" in
             echo "stopped"; exit 1
         fi
         ;;
-    *) die "usage: ${0##*/} {start|stop|restart|status|mute|unmute|mute-toggle}" ;;
+    *) die "usage: ${0##*/} {start|stop|restart|status|mute|unmute|mute-toggle|record-node}" ;;
 esac
