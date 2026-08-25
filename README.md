@@ -55,6 +55,7 @@ bin/elgato-doctor   end-to-end diagnostics
 bin/elgato-reset    power-cycle a wedged capture chip
 bin/elgato-obs-setup  write an OBS profile and scene collection for the card
 bin/elgato-driver   load the locally built module for this boot only
+libexec/elgato-player.py  the viewer's window and keys, incl. r and s
 lib/                shared helpers for the elgato-* helper scripts
 driver/cx231xx/     patched cx231xx source
 driver/patches/     every deviation from the stock kernel tree, with rationale
@@ -149,8 +150,10 @@ they arrived:
 
 That is the format to archive a tape in: nothing is thrown away, and the
 deinterlacing can be decided later, once, with as much time as it takes. It
-costs about 0.65 of one core to encode — measured on 720x576 of pure noise,
-which is the worst thing this codec can be handed.
+costs about 0.8 of one core to encode — measured on 720x576 of pure noise,
+which is the worst thing this codec can be handed, with the cost of generating
+those frames subtracted. It threads across slices, so on a modern machine that
+is roughly eight times faster than real time and the picture never waits.
 
 Measured on a real capture: 48 seconds of NES output came to 1200 frames in
 47.99s — 25.005 fps, not a frame dropped — and 215 MB, with no USB errors
@@ -279,6 +282,8 @@ and barely visible in a screenshot.
 ```
 elgato-audio start|stop|restart|status      # the pw-loopback that carries the sound
 elgato-audio mute|unmute|mute-toggle        # what the viewer's m key calls
+elgato-audio record-node                    # the capture source's PipeWire node,
+                                            #   as "NAME RATE CHANNELS"
 
 elgato-driver local [param=value ...]       # insmod the locally built module, this boot only
 elgato-driver stock                         # back to the distro module, immediately
@@ -290,6 +295,11 @@ elgato-reset                                # power-cycle a wedged capture chip
 
 `elgato-viewer` starts and stops the audio loopback for you; you only need
 `elgato-audio` directly to clear a stray one, or to check what is running.
+`record-node` is the one verb that is not about the loopback: it reports the
+capture source itself, which is what the viewer's `r` key records from and
+what anything else reading the audio directly would want. The rate and channel
+count come with it because this card is stereo or mono depending on what is fed
+into it, and a reader that guesses gets it wrong.
 
 Four environment variables override defaults:
 
