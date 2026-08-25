@@ -112,6 +112,7 @@ With the video window focused:
 | `--shot-dir DIR` | where `s` writes screenshots (default `~/elgato`) |
 | `--record-codec C` | `ffv1` (default) \| `h264` — see [Recording](#recording) |
 | `--no-record-audio` | leave the capture audio out of recordings |
+| `--record-av-offset MS` | move the recorded audio against the picture, positive is later (default 0) — see [Recording](#recording) |
 | `--field-order F` | `top` (default) \| `bottom` — which field of a recorded frame comes first |
 | `--reset` | power-cycle the capture box first (runs `elgato-reset`) |
 | `--check` | run the pre-flight checks and exit — add `--share` to check that path too |
@@ -167,6 +168,35 @@ Screenshots are PNG: lossless, and written at 768x576 (640x480 on NTSC), which
 is the capture with its non-square samples corrected rather than the window
 scaled up. They are deinterlaced with whatever method `c` last selected, so a
 still matches what you were looking at.
+
+#### If the sound sits wrong
+
+The picture and the sound reach this machine by different routes — one through
+the USB video path, one through ALSA and PipeWire — and each is timestamped
+when it arrives rather than when it happened. What survives that is a constant
+offset, the same in every recording, and `--record-av-offset` cancels it.
+
+Finding your number takes one recording of something with a sharp sound you can
+see happen:
+
+```
+mpv ~/elgato/elgato-….mkv     # then Ctrl-+ / Ctrl-- until it looks right
+```
+
+mpv prints `Audio delay: +0.040` on screen as you adjust. Multiply by 1000 and
+pass it in — `--record-av-offset 40` — and every recording after that is
+corrected as it is written. Measured: the correction lands within a
+millisecond of what you ask for.
+
+It is worth saying what this is *not* for. The two streams do not drift apart:
+each is timestamped on the same pipeline clock, so the relationship between
+sample and frame holds for the length of the recording. Only the fixed head
+start is in question, and only your ears can settle it. Leave it at 0 until
+something looks wrong.
+
+The first recording of a session may begin with a few tens of milliseconds of
+silence, because PipeWire has to wake the capture source. That is a late start,
+not an offset, and it corrects itself on the next one.
 
 Recordings are finished properly when you quit — the window waits for the
 muxer to write its index, which is what the difference between a file with a

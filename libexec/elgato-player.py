@@ -865,6 +865,19 @@ class Player:
                                 % (self.args.audio_rate,
                                    self.args.audio_channels)),
                 ]
+                # Shift the audio track against the picture, if asked. Video
+                # is stamped when the USB buffer completes and audio when
+                # PipeWire hands it over, and those two paths do not have the
+                # same latency -- the residue is a constant offset, which this
+                # cancels. It goes on the queue's src pad rather than the
+                # source's: a pad offset moves the segment, and moving a live
+                # source's segment is what went wrong when this branch tried to
+                # rebase itself to zero. Downstream of the queue there is no
+                # such edge to fall off, and a few hundred milliseconds against
+                # a running time measured in minutes is nowhere near one.
+                if self.args.av_offset:
+                    audio[1].get_static_pad("src").set_offset(
+                        self.args.av_offset * Gst.MSECOND)
                 if codec == "ffv1":
                     # Raw PCM, deliberately, beside lossless video.
                     #
@@ -1002,9 +1015,12 @@ class Player:
         rows = "\n".join("  %-5s %s" % (k, d) for k, d in KEYS)
         w, h = LADDER[self.idx]
         di = DEINTERLACERS[self.di_idx][0] if self.deint is not None else "off"
-        rec = "%s%s -> %s" % (self.args.record_codec,
-                              "" if self.args.audio_node else " (no sound)",
-                              self.args.record_dir)
+        rec = "%s%s%s -> %s" % (
+            self.args.record_codec,
+            "" if self.args.audio_node else " (no sound)",
+            "" if not self.args.av_offset
+            else "  audio %+dms" % self.args.av_offset,
+            self.args.record_dir)
         return ("elgato-viewer\n\n%s\n\n  size    %dx%d\n  deint   %s\n"
                 "  record  %s\n  shots   %dx%d -> %s\n"
                 "  device  %s\n  input   %s"
@@ -1121,6 +1137,8 @@ def main():
     # it.
     p.add_argument("--audio-rate", type=int, default=48000)
     p.add_argument("--audio-channels", type=int, default=2)
+    # Milliseconds to move the recorded audio by. Positive is later.
+    p.add_argument("--av-offset", type=int, default=0)
     p.add_argument("--shot-size", default="768x576")
     p.add_argument("--field-order", default="top-field-first",
                    choices=("top-field-first", "bottom-field-first"))

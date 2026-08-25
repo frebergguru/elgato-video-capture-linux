@@ -101,6 +101,17 @@ Play the Elgato Video Capture full-screen-able, low latency, with sound.
                                 hard to fault by eye, but no longer the
                                 original. Needs gst-plugins-ugly.
       --no-record-audio do not mux the capture audio into recordings
+      --record-av-offset MS
+                        move the recorded audio against the picture, in
+                        milliseconds; positive is later (default 0). The
+                        picture and the sound reach this machine by different
+                        routes, and what is left after both are timestamped is
+                        a constant offset. To find yours: record something with
+                        a sharp sound you can see happen, play it back with
+                          mpv FILE
+                        and hold Ctrl-plus / Ctrl-minus until it looks right --
+                        mpv prints "Audio delay: +0.040" as you go. Multiply
+                        by 1000 and pass it here to bake it in.
       --field-order F   top (default) | bottom -- which field of a recorded
                         frame comes first. The card does not say, and a player
                         told the wrong one makes motion judder or step
@@ -167,6 +178,10 @@ RECORD_DIR=""
 SHOT_DIR=""
 RECORD_CODEC="ffv1"
 RECORD_AUDIO=1
+# Milliseconds to move the recorded audio against the picture. Zero until
+# somebody measures otherwise -- see --record-av-offset in the usage above for
+# how to find the number.
+RECORD_AV_OFFSET=0
 # The card reports "interlaced" without saying which field is first, so a
 # recording has to be told. Top is what elgato-obs-setup defaults to for this
 # hardware; the symptom of getting it wrong is motion that judders or steps
@@ -196,6 +211,7 @@ while (( $# )); do
         --shot-dir)       need "$@"; SHOT_DIR=$2; shift 2 ;;
         --record-codec)   need "$@"; RECORD_CODEC=$2; shift 2 ;;
         --no-record-audio) RECORD_AUDIO=0; shift ;;
+        --record-av-offset) need "$@"; RECORD_AV_OFFSET=$2; shift 2 ;;
         --field-order)    need "$@"; FIELD_ORDER=$2; shift 2 ;;
         --share)          SHARE=1
                           if [[ ${2:-} == /dev/* ]]; then SHARE_DEV=$2; shift; fi
@@ -227,6 +243,11 @@ case "$RECORD_CODEC" in
     ffv1|h264) ;;
     *) die "--record-codec must be ffv1 or h264 (got '$RECORD_CODEC')" ;;
 esac
+
+[[ $RECORD_AV_OFFSET =~ ^-?[0-9]+$ ]] \
+    || die "--record-av-offset takes whole milliseconds (got '$RECORD_AV_OFFSET')"
+(( RECORD_AV_OFFSET >= -1000 && RECORD_AV_OFFSET <= 1000 )) \
+    || die "--record-av-offset is in milliseconds; beyond a second it is not a lip-sync correction any more (got '$RECORD_AV_OFFSET')"
 
 case "$FIELD_ORDER" in
     top)    FIELD_CAPS="top-field-first" ;;
@@ -1171,6 +1192,7 @@ while :; do
                   --audio-node "$REC_AUDIO_NODE" \
                   --audio-rate "$REC_AUDIO_RATE" \
                   --audio-channels "$REC_AUDIO_CHANNELS" \
+                  --av-offset "$RECORD_AV_OFFSET" \
                   --shot-size "${SHOT_W}x${SHOT_H}" \
                   --field-order "$FIELD_CAPS" \
                   --title "Elgato Video Capture" &
