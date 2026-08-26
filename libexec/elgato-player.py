@@ -832,10 +832,13 @@ class Player:
                    # one -- 90,000 of them in an hour. One a second seeks just
                    # as well and costs nothing.
                    min_index_interval=Gst.SECOND,
-                   # The pad offset in Branch.attach already brings the branch
-                   # back to near zero; this takes off the remaining few
-                   # milliseconds, and does it to video and audio together so
-                   # their relative offset is untouched.
+                   # This is what rebases the file to zero: the branch is
+                   # attached to a pipeline that may have been running for an
+                   # hour, so its buffers carry an hour of running time.
+                   # matroskamux rebases every stream by the earliest one, so
+                   # it does video and audio together and leaves the offset
+                   # between them untouched. Branch.attach deliberately does
+                   # NOT use pad offsets for this -- see the note there.
                    offset_to_zero=True)
         sink = make("filesink",
                     **{"location": path, "sync": False, "async": False})

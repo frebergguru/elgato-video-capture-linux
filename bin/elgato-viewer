@@ -24,9 +24,11 @@
 #    compositor ever stalls, old frames are dropped instead of accumulating --
 #    latency stays flat and you see a dropped frame rather than a growing delay.
 #
-#  * Deinterlacing defaults to 'linear', a single-field method with no temporal
-#    lookahead. The motion-adaptive methods look better on video but need future
-#    fields, which costs latency you can feel on a controller.
+#  * Deinterlacing defaults to 'yadif', which measured best on both combing
+#    and retained vertical detail and costs about 5ms. The lower-latency
+#    single-field methods are still a --deinterlace away: 'linear' is 0.3ms but
+#    combs on motion and loses about 17% of the vertical detail. See the
+#    measurements beside DEINTERLACERS in libexec/elgato-player.py.
 #
 # This script is deliberately self-contained: it shells out to elgato-audio,
 # elgato-reset and elgato-doctor, but shares no library with them.

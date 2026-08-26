@@ -53,11 +53,9 @@ USB_LINE=$(lsusb 2>/dev/null | grep -i "$ELGATO_USB_ID")
 if [[ -n $USB_LINE ]]; then
     ok "device present"
     info "$USB_LINE"
-    USB_PATH=$(readlink -f "/sys/bus/usb/devices/1-2" 2>/dev/null)
     for d in /sys/bus/usb/devices/*; do
         [[ -r $d/idVendor && -r $d/idProduct ]] || continue
         if [[ $(<"$d/idVendor") == 0fd9 && $(<"$d/idProduct") == 0037 ]]; then
-            USB_PATH=$d
             info "sysfs: $d  speed=$(<"$d/speed")Mbps  power/control=$(<"$d/power/control")"
             [[ $(<"$d/power/control") == on ]] \
                 || note "USB autosuspend is enabled; install the udev rule to pin it 'on'"
@@ -120,7 +118,7 @@ if [[ -n ${DEV:-} ]]; then
     if delivers_frames "$DEV" 20 5; then
         ok "captured 20 frames successfully"
         # Frames alone prove nothing: on an unconnected input the decoder
-        # free-runs and emits rolling noise at the nominal rate.
+        # keeps emitting a flat blanking level at the nominal rate.
         if has_signal "$DEV"; then
             ok "frames contain a real picture"
         else
