@@ -14,6 +14,21 @@ SELF_DIR=$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd)
 # shellcheck source=../lib/elgato-common.sh
 source "$SELF_DIR/../lib/elgato-common.sh"
 
+# What the card is on now, remembered before the power cycle takes the node
+# away. This used to force PAL and input 0 afterwards regardless, which quietly
+# converted an NTSC setup every time it was run. A wedged card may not answer
+# at all, so PAL/composite stay the fallback rather than the default.
+STD_BEFORE=pal
+INPUT_BEFORE=0
+if DEV_BEFORE=$(find_device); then
+    case "$(v4l2-ctl -d "$DEV_BEFORE" --get-standard 2>/dev/null)" in
+        *NTSC*|*PAL-M*|*PAL-60*) STD_BEFORE=ntsc ;;
+    esac
+    n=$(v4l2-ctl -d "$DEV_BEFORE" --get-input 2>/dev/null | grep -oE '[0-9]+' | head -1)
+    [[ -n $n ]] && INPUT_BEFORE=$n
+fi
+msg "Will restore input $INPUT_BEFORE, ${STD_BEFORE^^} after the reset"
+
 msg "Clearing all experiment parameters"
 for p in /sys/module/cx231xx/parameters/elgato_*; do
     [[ -e $p ]] || continue
@@ -26,8 +41,8 @@ done
 usb_reset_elgato || die "reset failed - unplug and replug the device by hand"
 
 DEV=$(require_device)
-v4l2-ctl -d "$DEV" -i 0 >/dev/null 2>&1
-v4l2-ctl -d "$DEV" -s pal >/dev/null 2>&1
+v4l2-ctl -d "$DEV" -i "$INPUT_BEFORE" >/dev/null 2>&1
+v4l2-ctl -d "$DEV" -s "$STD_BEFORE" >/dev/null 2>&1
 settle
 
 if has_signal "$DEV"; then
