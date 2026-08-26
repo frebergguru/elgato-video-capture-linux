@@ -89,8 +89,8 @@ discard this.
       --fps N         canvas frame rate: 25, 50, 29.97 or 59.94
                       (default: 50 for PAL, 59.94 for NTSC -- one frame per
                       field, which is what the 2x deinterlacer produces)
-      --deinterlace M yadif2x (default) | yadif | linear2x | linear | blend
-                      | discard | none
+      --deinterlace M yadif2x (default) | yadif | linear2x | linear | blend2x
+                      | blend | retro | discard | none -- OBS's own nine
       --field top|bottom   field order (default top)
       --sharp         nearest-neighbour scaling; crisp pixels, no blur
       --buffering     let the V4L2 source buffer frames (smoother under load,

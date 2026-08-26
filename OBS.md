@@ -207,13 +207,13 @@ byte what the direct profile gets.
 | `--pal` / `--ntsc` | force the TV standard (default: whatever the card is set to) |
 | `--canvas WxH` | canvas and output size (default 960x720, 4:3) |
 | `--fps N` | canvas frame rate: 25, 50, 29.97 or 59.94 (default: 50 for PAL, 59.94 for NTSC) |
-| `--deinterlace M` | `yadif2x` (default) \| `yadif` \| `linear2x` \| `linear` \| `blend` \| `discard` \| `none` |
+| `--deinterlace M` | `yadif2x` (default) \| `yadif` \| `linear2x` \| `linear` \| `blend2x` \| `blend` \| `retro` \| `discard` \| `none` — OBS's own nine modes, best first |
 | `--field top\|bottom` | field order (default `top`) |
 | `--sharp` | nearest-neighbour scaling |
 | `--buffering` | let the V4L2 source buffer frames — smoother under load, more latency |
 | `--no-audio` | do not add the audio source |
 | `--audio-device NODE` | PipeWire/PulseAudio source to capture (default: autodetect the Elgato node) |
-| `--recordings DIR` | where OBS writes recordings (default `$(xdg-user-dir VIDEOS)/elgato`) |
+| `--recordings DIR` | where OBS writes recordings (default `$(xdg-user-dir VIDEOS)/elgato`, falling back to `~/Videos/elgato` where that is unset) |
 | `--no-activate` | write the files but do not select them in OBS |
 | `--force` | overwrite an existing profile or scene collection |
 | `-n`, `--dry-run` | print what would be written, write nothing |
