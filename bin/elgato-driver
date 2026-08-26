@@ -18,23 +18,37 @@ KO="$BUILD_DIR/cx231xx.ko"
 KO_ALSA="$BUILD_DIR/cx231xx-alsa.ko"
 
 show_status() {
-    local src
-    src=$(modinfo -n cx231xx 2>/dev/null)
-    if lsmod | grep '^cx231xx ' >/dev/null; then
-        # An insmod'd module reports no filename via modinfo -n resolution
-        # against /lib/modules, so compare srcversion instead.
-        local live built
-        live=$(cat /sys/module/cx231xx/srcversion 2>/dev/null)
-        built=$(modinfo -F srcversion "$KO" 2>/dev/null)
-        if [[ -n $built && $live == "$built" ]]; then
-            echo "loaded driver : LOCAL BUILD ($KO)"
-        else
-            echo "loaded driver : distro in-tree ($src)"
-        fi
-        echo "srcversion    : $live"
-    else
+    if ! lsmod | grep '^cx231xx ' >/dev/null; then
         echo "loaded driver : cx231xx not loaded"
+        return
     fi
+
+    local src live built
+    src=$(modinfo -n cx231xx 2>/dev/null)
+    live=$(cat /sys/module/cx231xx/srcversion 2>/dev/null)
+    built=$(modinfo -F srcversion "$KO" 2>/dev/null)
+
+    # Whether the running module is the patched one is decided by whether it
+    # HAS the knobs, not by comparing srcversion against a file. install.sh
+    # runs 'make clean' when it finishes, so $KO is normally absent even though
+    # the module it installed is exactly what is loaded -- and the old test
+    # then fell through to "distro in-tree" while printing an updates/ path
+    # beside it, which is a straight contradiction.
+    #
+    # srcversion is still the right way to tell an insmod'd build from an
+    # installed one, so it is used for that and only that.
+    if [[ -e /sys/module/cx231xx/parameters/elgato_htl ]]; then
+        if [[ -n $built && $live == "$built" ]]; then
+            echo "loaded driver : LOCAL BUILD, insmod'd ($KO)"
+        else
+            echo "loaded driver : patched build${src:+ ($src)}"
+        fi
+        echo "elgato_htl    : $(<"/sys/module/cx231xx/parameters/elgato_htl")"
+    else
+        echo "loaded driver : distro in-tree${src:+ ($src)}"
+        echo "elgato_htl    : absent (stock module -- the picture will tear)"
+    fi
+    echo "srcversion    : $live"
 }
 
 unload() {
