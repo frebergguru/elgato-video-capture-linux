@@ -362,7 +362,7 @@ first: with nothing writing to it the node is not yet a camera.
 Sound needed none of this. PipeWire already hands the capture audio to every
 reader that asks, which is why `elgato-audio` uses `pw-loopback`.
 
-[OBS.md](OBS.md) explains all three ways to work and why each setting is what it
+[OBS.md](OBS.md) explains all four ways to work and why each setting is what it
 is.
 
 Keys need `python-gobject`, `gtk4` and `gst-plugin-gtk4` (Arch names — see

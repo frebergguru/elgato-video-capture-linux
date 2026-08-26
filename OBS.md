@@ -67,7 +67,7 @@ readers as ask for it, so `elgato-audio`'s loopback, OBS and anything else can
 all have the sound at once, sharing or not. That is exactly why `elgato-audio`
 uses `pw-loopback` instead of pulling audio into a pipeline.
 
-## Three ways to work
+## Four ways to work
 
 ### Both at once
 
