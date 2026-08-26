@@ -9,6 +9,7 @@ tearing the stock driver produces.
 ./install.sh             # build + install the driver, rules and launchers
 elgato-viewer            # play
 elgato-viewer --verify   # prove the picture is clean
+elgato-record -t 2h      # capture a tape, no display needed
 ```
 
 `./install.sh --no-driver` skips building the kernel module (rules and
@@ -67,12 +68,15 @@ carrying data spliced from several moments. If you install with
 
 ```
 bin/elgato-viewer   the player
+bin/elgato-record   record without a display -- over SSH, unattended
 bin/elgato-audio    audio loopback (pw-loopback); elgato-viewer starts it
 bin/elgato-doctor   end-to-end diagnostics
 bin/elgato-reset    power-cycle a wedged capture chip
 bin/elgato-obs-setup  write an OBS profile and scene collection for the card
 bin/elgato-driver   load the locally built module for this boot only
 libexec/elgato-player.py  the viewer's window and keys, incl. r and s
+libexec/elgato-recorder.py  the headless recording engine, no GTK
+libexec/elgato_recording.py  what a recording IS -- shared by both of those
 lib/elgato-common.sh  shared helpers for the elgato-* helper scripts
 lib/elgato-distro.sh  package names, root, module paths, per distribution
 driver/cx231xx/     patched cx231xx source
@@ -190,6 +194,113 @@ is the capture with its non-square samples corrected rather than the window
 scaled up. They are deinterlaced with whatever method `c` last selected, so a
 still matches what you were looking at.
 
+#### Without a display
+
+`r` is a feature of a window: it needs GTK4, `gtk4paintablesink` and a
+compositor before it can write a byte. Archiving a tape is the job you would
+least like to need a desktop session for, so `elgato-record` is that same
+recording with the window taken out.
+
+```
+elgato-record                  # until stopped
+elgato-record -t 2h            # a whole tape, then finish cleanly
+elgato-record --check          # device, picture, sound, disk -- then exit
+elgato-record status           # from any other shell
+elgato-record stop             # finishes the file properly
+```
+
+It writes the same file `r` does, because it is the same code: the encoders,
+the muxer and the audio all come from `libexec/elgato_recording.py`, which both
+the viewer and this share. Everything in [Recording](#recording) above — FFV1
+by default, `--codec h264` for something to watch, the field order, the
+lip-sync correction — applies unchanged.
+
+| option | |
+| ------ | --- |
+| `-o`, `--output FILE` | where to write (default `~/elgato/elgato-<date>-<time>.mkv`) |
+| `--record-dir DIR` | where that default name lands |
+| `-t`, `--duration T` | record for `90`, `90s`, `45m`, `2h` or `1:30:00`, then finish |
+| `--codec C` | `ffv1` (default) \| `h264` — same trade as `--record-codec` |
+| `--no-audio` | leave the capture sound out of the file |
+| `--av-offset MS` | bake in a lip-sync correction, as `--record-av-offset` does |
+| `--field-order F` | `top` (default) \| `bottom` |
+| `-i`, `--input WHICH` | `composite` (default) \| `svideo` |
+| `--pal` / `--ntsc` | force the TV standard |
+| `-d`, `--device PATH` | V4L2 node (default: autodetect) |
+| `--reset` | power-cycle the capture box first |
+| `--check` | run the preflight and exit without recording |
+| `-q`, `--quiet` | no progress line |
+
+**Stopping it is the part that matters.** matroskamux writes its index and
+duration when the stream *ends*, so a recording has to be finished rather than
+killed — an MKV that never got that has no duration and seeks badly. Ctrl-C,
+`elgato-record stop`, SIGTERM and SIGHUP all finish it properly, which means a
+dropped SSH connection costs nothing. Measured: about half a second from the
+signal to a closed file. `kill -9` is the one way to lose the index.
+
+`stop` sends SIGTERM rather than SIGINT deliberately. A shell without job
+control — a script, `nohup`, `systemd-run` — sets SIGINT to `SIG_IGN` in its
+background children, and a signal that was ignored on entry cannot be trapped
+afterwards. Measured: `SigIgn: 0000000000000007` in `/proc/PID/status`, the
+trap silently not installed, and `stop` doing nothing at all.
+
+Because nobody is watching the picture, it says what it found before it starts
+and accounts for every frame when it finishes:
+
+```
+$ elgato-record -t 20
+:: Device: /dev/elgato
+:: Input: Composite   Standard: PAL   720x576 @ 25fps
+:: Picture: present
+:: Audio: alsa_input.usb-Elgato_Video_Capture_…stereo-fallback (48000Hz, 2ch)
+:: Disk: 775.3 GB free, about 90 MB needed for 0:20
+:: Recording to /home/you/elgato/elgato-20260826-205135.mkv
+● REC 0:19  42 MB  2.2 MB/s  481 frames  775.2 GB free
+:: Saved /home/you/elgato/elgato-20260826-205135.mkv  (0:20, 45 MB)
+:: 506 frames in 20.20s -- 25.006 fps, none lost
+```
+
+That last line is a claim about *capture*, not about picture: this card
+delivers corrupt frames at exactly the right rate, so a full frame count proves
+the driver kept up and nothing more. `elgato-viewer --verify` measures the
+other half and needs no display either — worth running before committing to a
+two-hour capture.
+
+The frame count is counted where the frames arrive from the card, and the queue
+below it does not leak. That is the one deliberate difference from the viewer's
+recording: `r` leaks, because a stalled disk must never stall the live picture,
+but here there is no picture to protect and a leak would be a hole in the
+middle of an archive.
+
+Two things go wrong over SSH and nowhere else, and both are checked before it
+starts:
+
+- **The device is there but unreadable.** The udev rule hands it over with
+  `TAG+="uaccess"`, which is an ACL for whoever is logged in *at the screen*. An
+  SSH session is not, so on a machine with nobody at the keyboard the node
+  exists and cannot be opened. `sudo usermod -aG video $USER` is the fix.
+- **There is no sound.** PipeWire is a user service; with no session running
+  there is nothing to read the audio from. The recording goes ahead silently
+  and says so, and `sudo loginctl enable-linger $USER` is what starts those
+  services without a login.
+
+Only one program can open the card, so a running viewer blocks a recording and
+the other way round. If you want both, the viewer will lend you the picture:
+
+```
+elgato-viewer --share                    # captures, republishes on /dev/elgato-share
+elgato-record -d /dev/elgato-share       # record what it is showing
+```
+
+For something long, run it under `tmux` or as a transient unit, and come back
+to it later:
+
+```
+systemd-run --user --unit=tape elgato-record -t 3h
+elgato-record status
+elgato-record stop
+```
+
 #### If the sound sits wrong
 
 The picture and the sound reach this machine by different routes — one through
@@ -296,9 +407,14 @@ and barely visible in a screenshot.
 ## The other tools
 
 `elgato-viewer` and `elgato-obs-setup` take options; the rest take verbs.
-`elgato-doctor` and `elgato-reset` take nothing at all.
+`elgato-record` takes both — options to start a recording, verbs to act on one
+that is already running. `elgato-doctor` and `elgato-reset` take nothing at all.
 
 ```
+elgato-record [options]                     # record; see Recording headless
+elgato-record stop                          # finish the running recording properly
+elgato-record status                        # what is recording, how long, how big
+
 elgato-audio start|stop|restart|status      # the pw-loopback that carries the sound
 elgato-audio mute|unmute|mute-toggle        # what the viewer's m key calls
 elgato-audio record-node                    # the capture source's PipeWire node,
@@ -392,6 +508,9 @@ Run `elgato-doctor` first; it checks the whole chain and says which link failed.
 | no frames, `cannot change alt number` | USB link wedged — `elgato-viewer --reset` |
 | frames but no picture | check the yellow RCA at both ends, and `--ntsc`/`--pal` |
 | captured audio in voice chat | WirePlumber rule missing — re-run `install.sh` |
+| `elgato-record` cannot open the device over SSH | `uaccess` grants an ACL to the seat session, not to you — `sudo usermod -aG video $USER` |
+| a recording came out silent | no PipeWire in that session — `sudo loginctl enable-linger $USER` |
+| a recording has no duration and seeks badly | it was killed rather than stopped — use `elgato-record stop` |
 | garbled or doubled audio | stray loopbacks — `elgato-audio stop` |
 | `--share` will not start, or OBS shows nothing | `elgato-doctor` has a Sharing section; the failure modes are listed in [OBS.md](OBS.md) |
 
@@ -442,10 +561,16 @@ hand, run `install.sh` — it checks for each tool and names the package for the
 distribution you are actually on, including which extra repository it needs
 where that applies.
 
-The `r` key additionally needs `gst-libav`, for the FFV1 encoder, and
-`--record-codec h264` needs `gst-plugins-ugly` for x264. Neither is required
-to watch: without them everything else works and `r` says which package is
-missing. `s` needs nothing beyond `good`.
+Recording — the `r` key and `elgato-record` alike — additionally needs
+`gst-libav`, for the FFV1 encoder, and the `h264` codec needs
+`gst-plugins-ugly` for x264. Neither is required to watch: without them
+everything else works and both say which package is missing. `s` needs nothing
+beyond `good`.
+
+`elgato-record` needs `python-gobject` (`python3-gi` on Debian) but **not**
+GTK, which is what lets it run over SSH; the viewer's keys need both. Nothing
+in the headless path imports GTK, and a display is never opened — tested with
+`DISPLAY` and `WAYLAND_DISPLAY` unset.
 
 `--share` additionally needs the `v4l2loopback` module; `install.sh` offers to
 install and configure it under whatever name your distribution uses, and

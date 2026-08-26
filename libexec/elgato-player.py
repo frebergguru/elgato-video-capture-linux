@@ -45,6 +45,15 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
 from gi.repository import Gdk, GLib, Gst, Gtk  # noqa: E402
 
+# Sibling module, next to this file. Python puts a script's own directory on
+# sys.path, but this one is reached through a symlink in ~/.local/bin by way of
+# bin/elgato-viewer, so say where it is rather than depend on how that resolves.
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from elgato_recording import (  # noqa: E402
+    BranchError, DEINTERLACERS, RECORD_MIN_FREE, RECORD_STOP_FREE,
+    audio_chain, caps_filter, chain_into, make, missing_encoder, mux_and_sink,
+    video_chain)
+
 # GLib.unix_signal_add moved to GLibUnix and warns on newer PyGObject; keep
 # working on both rather than printing a deprecation notice over the output.
 try:
@@ -132,24 +141,6 @@ def free_bytes(path):
         return -1                  # unknown: do not stand in the way
 
 
-# A branch that errors does not fail alone -- the flow error travels back
-# through the tee and v4l2src posts "internal data stream error", which stops
-# the picture as well. On a recording the one realistic way that happens is a
-# full disk, so it is headed off instead of handled: refuse to start with less
-# than the first figure free, and stop cleanly on the way down to the second
-# rather than let filesink discover ENOSPC.
-RECORD_MIN_FREE = 1 << 30          # 1 GB to start
-RECORD_STOP_FREE = 512 << 20       # 512 MB to keep going
-
-
-# Measured on 400 frames of real motion from this capture card:
-#   yadif    comb 0.31  v-detail 86.0   latency 5.1ms
-#   greedyh  comb 0.61  v-detail 86.3   latency 1.7ms
-#   linear   comb 1.04  v-detail 73.6   latency 0.3ms
-# yadif is best on picture and costs 5ms, so it is the default; the others are
-# here for anyone who would rather have the last few milliseconds.
-DEINTERLACERS = [("yadif", 10), ("greedyh", 1), ("linear", 4)]
-
 KEYS = [
     ("f", "fullscreen on/off"),
     ("z", "smaller window"),
@@ -182,41 +173,6 @@ BRANCH_EOS_TIMEOUT_MS = 5000
 # nothing arrives during the wait and the only cost is that a screenshot
 # branch lives a fifth of a second longer than it needs to.
 BRANCH_SETTLE_MS = 200
-
-
-# Package hints for the encoders, so a missing plugin says what to install
-# rather than "no element avenc_ffv1".
-CODEC_PKG = {"ffv1": ("avenc_ffv1", "gst-libav"),
-             "h264": ("x264enc", "gst-plugins-ugly")}
-
-
-class BranchError(Exception):
-    """A branch could not be built or attached. Never fatal: the picture keeps
-    playing and the reason goes on screen."""
-
-
-def make(factory, **props):
-    el = Gst.ElementFactory.make(factory, None)
-    if el is None:
-        raise BranchError("this GStreamer has no '%s'" % factory)
-    for k, v in props.items():
-        el.set_property(k.replace("_", "-"), v)
-    return el
-
-
-def caps_filter(text):
-    return make("capsfilter", caps=Gst.Caps.from_string(text))
-
-
-def chain_into(container, elements):
-    """Add elements to a bin in order and link them into a chain."""
-    for el in elements:
-        container.add(el)
-    for a, b in zip(elements, elements[1:]):
-        if not a.link(b):
-            raise BranchError("cannot link %s to %s"
-                              % (a.get_factory().get_name(),
-                                 b.get_factory().get_name()))
 
 
 def request_pad(element, template):
@@ -738,10 +694,9 @@ class Player:
             self.show_toast("this pipeline has no tee to record from")
             return
         codec = self.args.record_codec
-        element, package = CODEC_PKG[codec]
-        if Gst.ElementFactory.find(element) is None:
-            self.show_toast("%s recording needs %s (%s)"
-                            % (codec, element, package))
+        missing = missing_encoder(codec)
+        if missing is not None:
+            self.show_toast("%s recording needs %s (%s)" % ((codec,) + missing))
             return
         try:
             path = self.capture_path(self.args.record_dir, "mkv")
@@ -780,68 +735,34 @@ class Player:
                         % (os.path.basename(path), codec, sound))
 
     def build_record_bin(self, path, codec):
+        """The shared recording chain, wrapped so it can hang off the tee.
+
+        What is added here is only what being a *branch* requires: a Bin with a
+        ghost pad, so the whole thing can be attached and detached while the
+        window keeps playing, and a leaky queue at its head. Everything about
+        the recording itself -- the encoders, the muxer, the audio -- comes
+        from libexec/elgato_recording.py, which elgato-record uses too, so the
+        two write identical files.
+        """
         container = Gst.Bin.new(self.branch_name("record"))
 
         # Deep and time-bounded rather than the two or three buffers the live
         # taps use. Leaking is still the last resort -- a stalled disk must
         # never stall the picture -- but a leak here drops frames out of the
         # middle of the recording, so give the encoder two whole seconds of
-        # slack to catch up in before it comes to that.
+        # slack to catch up in before it comes to that. (elgato-record does not
+        # leak: with no picture to protect, dropping frames is pure loss.)
         video = [
             make("queue", max_size_buffers=0, max_size_bytes=0,
                  max_size_time=2 * Gst.SECOND, leaky=2),
-            # The card says "interlaced" but not which field comes first, so
-            # ffprobe reports field_order=unknown and a player has to guess --
-            # guess wrong and motion steps backwards. Say it here. Top field
-            # first is what elgato-obs-setup already defaults to for this
-            # hardware; --field-order bottom is the escape hatch, same as the
-            # OBS tool's --field.
-            make("capssetter", caps=Gst.Caps.from_string(
-                "video/x-raw,field-order=(string)%s" % self.args.field_order)),
-        ]
-        if codec == "ffv1":
-            video += [
-                make("videoconvert"),
-                # Pin 4:2:2. avenc_ffv1 advertises I420 first, so a bare
-                # videoconvert negotiates it and throws away half the chroma --
-                # a lossless codec quietly fed a lossy conversion. YUY2 to Y42B
-                # is a repack of the same samples and loses nothing.
-                caps_filter("video/x-raw,format=Y42B"),
-                # Measured on 720x576 snow, the worst case this codec can be
-                # handed: 10x real time, about 0.65 of one core at 25fps.
-                make("avenc_ffv1", threads=0, slices=16, coder=-2, context=1),
-            ]
-        else:
-            video += [
-                make("deinterlace", mode=1, method=self.deint_method()),
-                make("videoconvert"),
-                # 4:2:0, explicitly. Left alone, x264enc negotiates 4:4:4 off
-                # this 4:2:2 source and produces High 4:4:4 Predictive, which
-                # is larger and which most players and every hardware decoder
-                # refuse. The whole point of this mode is a file that opens
-                # anywhere.
-                caps_filter("video/x-raw,format=I420"),
-                make("x264enc", **{"pass": 4, "quantizer": 18,
-                                   "speed-preset": 5}),
-            ]
+        ] + video_chain(codec, self.args.field_order,
+                        # Match what is on screen: somebody who cycled to
+                        # greedyh with c is telling us which trade-off they
+                        # want, and an h264 recording that quietly used
+                        # something else would not be what they were watching.
+                        deint_method=self.deint_method())
 
-        mux = make("matroskamux",
-                   writing_app="elgato-viewer",
-                   # FFV1 is all-intra, so every frame is a keyframe and the
-                   # default index interval of 0 writes a cue entry for each
-                   # one -- 90,000 of them in an hour. One a second seeks just
-                   # as well and costs nothing.
-                   min_index_interval=Gst.SECOND,
-                   # This is what rebases the file to zero: the branch is
-                   # attached to a pipeline that may have been running for an
-                   # hour, so its buffers carry an hour of running time.
-                   # matroskamux rebases every stream by the earliest one, so
-                   # it does video and audio together and leaves the offset
-                   # between them untouched. Branch.attach deliberately does
-                   # NOT use pad offsets for this -- see the note there.
-                   offset_to_zero=True)
-        sink = make("filesink",
-                    **{"location": path, "sync": False, "async": False})
+        mux, sink = mux_and_sink(path, "elgato-viewer")
 
         # Audio is built before anything joins the bin, so that a missing
         # encoder or an absent capture source costs the sound and not the
@@ -850,51 +771,9 @@ class Player:
         audio_src = None
         if self.args.audio_node:
             try:
-                audio_src = make("pulsesrc", device=self.args.audio_node,
-                                 provide_clock=False)
-                audio = [
-                    audio_src,
-                    make("queue", max_size_time=2 * Gst.SECOND, leaky=2),
-                    make("audioconvert"),
-                    make("audioresample"),
-                    # Pin the format to what the node really is. Left to
-                    # negotiate freely against a flexible sink, pulsesrc
-                    # settles on its own defaults rather than the device's --
-                    # measured: 44100 mono off a node that was 48000 stereo,
-                    # which is a resample and a lost channel, silently. The
-                    # figures come from PipeWire via elgato-audio, so a mono
-                    # feed is recorded as mono rather than forced to stereo.
-                    caps_filter("audio/x-raw,format=S16LE,rate=%d,channels=%d"
-                                % (self.args.audio_rate,
-                                   self.args.audio_channels)),
-                ]
-                # Shift the audio track against the picture, if asked. Video
-                # is stamped when the USB buffer completes and audio when
-                # PipeWire hands it over, and those two paths do not have the
-                # same latency -- the residue is a constant offset, which this
-                # cancels. It goes on the queue's src pad rather than the
-                # source's: a pad offset moves the segment, and moving a live
-                # source's segment is what went wrong when this branch tried to
-                # rebase itself to zero. Downstream of the queue there is no
-                # such edge to fall off, and a few hundred milliseconds against
-                # a running time measured in minutes is nowhere near one.
-                if self.args.av_offset:
-                    audio[1].get_static_pad("src").set_offset(
-                        self.args.av_offset * Gst.MSECOND)
-                if codec == "ffv1":
-                    # Raw PCM, deliberately, beside lossless video.
-                    #
-                    # flacenc would halve the size and is also lossless, but it
-                    # rewrites its stream header at end-of-stream, and a branch
-                    # that is detached the moment EOS lands does not give the
-                    # muxer time to take the new one: measured, every recording
-                    # came out with an undecodable audio track ("invalid sync
-                    # code") and a container duration of 2**64-1 nanoseconds.
-                    # PCM has nothing to finalise. Against FFV1's ~10 MB/s the
-                    # extra 190 KB/s does not register.
-                    pass
-                else:
-                    audio.append(make("opusenc"))
+                audio, audio_src = audio_chain(
+                    self.args.audio_node, self.args.audio_rate,
+                    self.args.audio_channels, codec, self.args.av_offset)
             except BranchError as exc:
                 audio, audio_src = [], None
                 self.show_toast("recording without sound: %s" % exc)

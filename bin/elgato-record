@@ -1,0 +1,563 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Hypnotize
+# elgato-record -- capture a tape to a file with nothing attached to a screen.
+#
+# The viewer's r key already records, and records well, but it is a feature of
+# a window: it needs GTK4, gtk4paintablesink and a compositor to exist before
+# it can write a byte. Over SSH none of that is true, and archiving a tape --
+# hours long, unattended, the machine watching a screen nobody is looking at --
+# is exactly the job you would rather not need a desktop session for.
+#
+# So this is that same recording with the window taken out. The pipeline is
+# built by libexec/elgato-recorder.py from libexec/elgato_recording.py, which
+# libexec/elgato-player.py uses too: the file this writes and the file r writes
+# are the same file.
+#
+# What lives here rather than there is everything about the *session*: which
+# device, which standard, is there a picture, is there sound, is there room on
+# the disk -- and the pidfile that makes a detached recording something you can
+# come back to and stop.
+#
+# Two headless facts worth knowing, both handled by preflight() below:
+#
+#  * The udev rule hands the device over with TAG+="uaccess", which is an ACL
+#    granted to the user of the ACTIVE SEAT SESSION. An SSH login is not one,
+#    so on a machine where nobody is logged in at the screen the node is there
+#    and unreadable. The video group is the fix.
+#  * PipeWire is a user service. With no graphical session running there may be
+#    no PipeWire to read the sound from, and the recording is silent. Rather
+#    than fail, it says so and records the picture.
+
+set -uo pipefail
+
+SELF_DIR=$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd)
+# shellcheck source=../lib/elgato-common.sh
+source "$SELF_DIR/../lib/elgato-common.sh"
+
+RECORDER="$SELF_DIR/../libexec/elgato-recorder.py"
+
+RUN_DIR="${XDG_RUNTIME_DIR:-/tmp}/elgato"
+PID_FILE="$RUN_DIR/record.pid"
+STATE_FILE="$RUN_DIR/record.state"
+
+# Where a recording lands when nothing says otherwise -- the same directory the
+# viewer's r and s keys use, so a session's files sit together whether they were
+# made from the window or over SSH. Created on first use, never at startup.
+CAPTURE_DIR="$HOME/elgato"
+
+# Roughly what a second costs on disk. FFV1 is the measured figure for console
+# output; noisy tape compresses worse, which is why what uses this is a warning
+# and not a refusal.
+declare -A MB_PER_SEC=([ffv1]=4.5 [h264]=0.25)
+
+# --------------------------------------------------------------- usage ----
+usage() {
+    cat <<EOF
+usage: ${0##*/} [options]        record until stopped
+       ${0##*/} stop             finish the running recording properly
+       ${0##*/} status           what is being recorded, for how long, how big
+
+Record the Elgato Video Capture to a Matroska file. No window, no display: this
+is the one to run over SSH. Same pipeline as the viewer's r key.
+
+  -o, --output FILE     where to write (default:
+                        $CAPTURE_DIR/elgato-<date>-<time>.mkv)
+      --record-dir DIR  where that default name lands (default $CAPTURE_DIR)
+  -t, --duration T      record for T and then finish cleanly. Accepts
+                        90, 90s, 45m, 2h or 1:30:00.
+      --codec C         ffv1 (default) | h264
+                          ffv1  lossless: exactly the frames the card
+                                delivered, still interlaced. 4.5 MB/s
+                                measured, i.e. about 16 GB an hour. This is
+                                what to archive a tape with. Needs gst-libav.
+                          h264  deinterlaced to 50fps at quantizer 18: about a
+                                twentieth of the size and still hard to fault
+                                by eye, but no longer the original. Needs
+                                gst-plugins-ugly.
+      --no-audio        leave the capture sound out of the file
+      --av-offset MS    move the recorded audio against the picture, positive
+                        is later (default 0). See "If the sound sits wrong" in
+                        README.md for how to find your number.
+      --field-order F   top (default) | bottom -- which field of a recorded
+                        frame comes first. A player told the wrong one makes
+                        motion judder or step backwards.
+
+  -i, --input WHICH     composite (default) | svideo | 0 | 1
+      --pal / --ntsc    force the TV standard
+                        (default: leave whatever the device is already on)
+  -d, --device PATH     V4L2 node (default: autodetect, preferring /dev/elgato)
+      --reset           power-cycle the capture box first (runs elgato-reset)
+
+      --check           run the preflight -- device, picture, sound, disk --
+                        and exit without recording anything
+  -q, --quiet           no progress line; messages and the final report only
+      --debug           print GStreamer's debug detail on an error
+  -h, --help            this
+
+Leaving it running:
+
+  ${0##*/} -t 2h &                 # or under tmux, nohup, systemd-run
+  ${0##*/} status                  # from any other shell, later
+  ${0##*/} stop                    # finishes the file properly
+
+Ctrl-C, SIGTERM and SIGHUP all finish the file rather than truncate it, so a
+dropped SSH connection costs nothing. What must not happen is SIGKILL: an MKV
+whose index was never written has no duration and seeks badly.
+
+To check the picture is not tearing before committing to a long capture:
+  elgato-viewer --verify           # measures frame integrity; needs no display
+EOF
+}
+
+# --------------------------------------------------------- running state ----
+# The pid in the file is this script's, not the Python engine's: this script
+# forwards the signal on and stays around to report afterwards, so it is the
+# one thing to talk to.
+is_recording() {
+    [[ -r $PID_FILE ]] || return 1
+    local pid; pid=$(<"$PID_FILE")
+    [[ -n $pid ]] && kill -0 "$pid" 2>/dev/null
+}
+
+state_get() {
+    [[ -r $STATE_FILE ]] || return 1
+    sed -n "s/^$1=//p" "$STATE_FILE" | head -1
+}
+
+human() {
+    local b=${1:-0}
+    if (( b >= 1073741824 )); then
+        awk -v b="$b" 'BEGIN { printf "%.1f GB\n", b / 1073741824 }'
+    else
+        echo "$(( b / 1048576 )) MB"
+    fi
+}
+
+mmss() {
+    local s=${1:-0}
+    if (( s >= 3600 )); then
+        printf '%d:%02d:%02d\n' $(( s / 3600 )) $(( (s / 60) % 60 )) $(( s % 60 ))
+    else
+        printf '%d:%02d\n' $(( s / 60 )) $(( s % 60 ))
+    fi
+}
+
+do_status() {
+    if ! is_recording; then
+        echo "stopped"
+        return 1
+    fi
+    local out started now size
+    out=$(state_get output); started=$(state_get started)
+    now=$(date +%s); size=0
+    [[ -r $out ]] && size=$(stat -c%s "$out" 2>/dev/null || echo 0)
+    printf 'recording  %s  %s  %s\n' \
+        "$(mmss $(( now - ${started:-now} )))" "$(human "$size")" "$out"
+}
+
+do_stop() {
+    if ! is_recording; then
+        warn "no recording is running"
+        return 1
+    fi
+    local pid out; pid=$(<"$PID_FILE"); out=$(state_get output)
+    msg "Finishing $out"
+    # SIGTERM rather than SIGINT, which is not a matter of taste.
+    #
+    # A shell without job control -- a script, nohup, systemd-run, anything
+    # started as "elgato-record &" from a non-interactive shell -- sets SIGINT
+    # and SIGQUIT to SIG_IGN in its asynchronous children, and bash cannot trap
+    # a signal that was already ignored when it started. Measured on exactly
+    # that: "SigIgn: 0000000000000007" in /proc/PID/status, the trap silently
+    # not installed, and "elgato-record stop" doing nothing at all while the
+    # recording carried on. SIGTERM is never in that set.
+    #
+    # Then patience. The wait is matroskamux writing its index -- measured at
+    # about 100ms for a short file -- and killing instead of waiting is
+    # precisely how a recording ends up with no duration.
+    kill -TERM "$pid" 2>/dev/null || { warn "could not signal pid $pid"; return 1; }
+    local i
+    for i in $(seq 60); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.5
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        warn "it has not finished after 30s -- still writing? Check: ${0##*/} status"
+        return 1
+    fi
+    local size=0
+    [[ -r $out ]] && size=$(stat -c%s "$out" 2>/dev/null || echo 0)
+    msg "Stopped -- $out ($(human "$size"))"
+}
+
+case "${1:-}" in
+    stop)   do_stop;   exit $? ;;
+    status) do_status; exit $? ;;
+esac
+
+# ------------------------------------------------------------- defaults ----
+OUTPUT=""
+RECORD_DIR=""
+DURATION=0
+CODEC="ffv1"
+WANT_AUDIO=1
+AV_OFFSET=0
+FIELD_ORDER="top"
+INPUT="composite"
+STANDARD=""
+DEVICE=""
+DO_RESET=0
+CHECK_ONLY=0
+QUIET=0
+DEBUG=0
+
+need() { [[ $# -ge 2 && -n $2 ]] || die "$1 needs a value"; }
+
+# 90 | 90s | 45m | 2h | 1:30:00 | 90:00  ->  seconds
+parse_duration() {
+    local t=$1 h m s
+    case $t in
+        *:*:*) IFS=: read -r h m s <<< "$t"
+               [[ $h$m$s =~ ^[0-9]+$ ]] || return 1
+               echo $(( 10#$h * 3600 + 10#$m * 60 + 10#$s )) ;;
+        *:*)   IFS=: read -r m s <<< "$t"
+               [[ $m$s =~ ^[0-9]+$ ]] || return 1
+               echo $(( 10#$m * 60 + 10#$s )) ;;
+        *h)    [[ ${t%h} =~ ^[0-9]+$ ]] || return 1; echo $(( ${t%h} * 3600 )) ;;
+        *m)    [[ ${t%m} =~ ^[0-9]+$ ]] || return 1; echo $(( ${t%m} * 60 )) ;;
+        *s)    [[ ${t%s} =~ ^[0-9]+$ ]] || return 1; echo $(( ${t%s} )) ;;
+        *)     [[ $t =~ ^[0-9]+$ ]] || return 1; echo $(( t )) ;;
+    esac
+}
+
+while (( $# )); do
+    case "$1" in
+        -o|--output)      need "$@"; OUTPUT=$2; shift 2 ;;
+        --record-dir)     need "$@"; RECORD_DIR=$2; shift 2 ;;
+        -t|--duration)    need "$@"
+                          DURATION=$(parse_duration "$2") \
+                              || die "--duration takes 90, 90s, 45m, 2h or 1:30:00 (got '$2')"
+                          (( DURATION > 0 )) || die "--duration must be more than nothing"
+                          shift 2 ;;
+        --codec)          need "$@"; CODEC=$2; shift 2 ;;
+        --no-audio)       WANT_AUDIO=0; shift ;;
+        --av-offset)      need "$@"; AV_OFFSET=$2; shift 2 ;;
+        --field-order)    need "$@"; FIELD_ORDER=$2; shift 2 ;;
+        -i|--input)       need "$@"; INPUT=$2; shift 2 ;;
+        --pal)            STANDARD="pal";  shift ;;
+        --ntsc)           STANDARD="ntsc"; shift ;;
+        -d|--device)      need "$@"; DEVICE=$2; shift 2 ;;
+        --reset)          DO_RESET=1; shift ;;
+        --check)          CHECK_ONLY=1; shift ;;
+        -q|--quiet)       QUIET=1; shift ;;
+        --debug)          DEBUG=1; shift ;;
+        -h|--help)        usage; exit 0 ;;
+        *)                usage >&2; die "unknown option: $1" ;;
+    esac
+done
+
+case "$INPUT" in
+    composite|composite1|comp|0) INPUT_N=0; INPUT_NAME="Composite" ;;
+    svideo|s-video|1)            INPUT_N=1; INPUT_NAME="S-Video" ;;
+    *) die "--input must be composite or svideo (got '$INPUT')" ;;
+esac
+
+case "$CODEC" in
+    ffv1|h264) ;;
+    *) die "--codec must be ffv1 or h264 (got '$CODEC')" ;;
+esac
+
+case "$FIELD_ORDER" in
+    top)    FIELD_CAPS="top-field-first" ;;
+    bottom) FIELD_CAPS="bottom-field-first" ;;
+    *) die "--field-order must be top or bottom (got '$FIELD_ORDER')" ;;
+esac
+
+[[ $AV_OFFSET =~ ^-?[0-9]+$ ]] \
+    || die "--av-offset takes whole milliseconds (got '$AV_OFFSET')"
+(( AV_OFFSET >= -1000 && AV_OFFSET <= 1000 )) \
+    || die "--av-offset is in milliseconds; beyond a second it is not a lip-sync correction any more (got '$AV_OFFSET')"
+
+[[ -n $RECORD_DIR ]] || RECORD_DIR=$CAPTURE_DIR
+
+for tool in v4l2-ctl gst-launch-1.0 python3; do
+    command -v "$tool" >/dev/null || die "$tool is not installed"
+done
+[[ -r $RECORDER ]] || die "libexec/elgato-recorder.py is missing beside this script"
+
+# The engine needs PyGObject and GStreamer's Python bindings for GLib -- but
+# NOT GTK, which is the whole point of it. Say which package is missing rather
+# than let python3 print a traceback.
+python3 - <<'EOF' >/dev/null 2>&1 || die "python-gobject is not installed (Debian/Fedora: python3-gi) -- elgato-record needs it, but not GTK"
+import gi
+gi.require_version("Gst", "1.0")
+from gi.repository import Gst, GLib
+EOF
+
+# ------------------------------------------------------------- preflight ----
+# Everything that is invisible when there is no screen. Order matters: the
+# cheap identity checks first, then the ones that open the device, and the
+# device is opened as few times as possible because this chip needs a moment
+# between streaming sessions.
+
+CAP_W=720; CAP_H=576; CAP_FPS=25; CAP_PAR="16/15"; STD_NAME="PAL"
+AUDIO_NODE=""; AUDIO_RATE=48000; AUDIO_CHANNELS=2
+
+preflight() {
+    local rc=0
+
+    if [[ -n $DEVICE ]]; then
+        [[ -c $DEVICE ]] || die "$DEVICE is not a character device"
+    else
+        DEVICE=$(require_device)
+    fi
+    msg "Device: $DEVICE"
+
+    # Present but unreadable is the classic headless failure, and it looks
+    # nothing like a permissions problem from the outside: the node is right
+    # there in /dev.
+    if [[ ! -r $DEVICE || ! -w $DEVICE ]]; then
+        warn "$DEVICE is not readable by you."
+        warn "The udev rule grants it with TAG+=\"uaccess\", which is an ACL for"
+        warn "whoever is logged in AT THE SCREEN -- an SSH session gets nothing"
+        warn "when nobody is. Add yourself to the group that owns it instead:"
+        warn "    sudo usermod -aG video $USER      # then log in again"
+        return 1
+    fi
+
+    local eproto; eproto=$(usb_errors_since_plug)
+    if (( eproto > 0 )); then
+        warn "$eproto USB control-transfer errors since the box last enumerated"
+        warn "the link may be wedged; if this fails, run:  ${0##*/} --reset"
+    fi
+
+    # Input and standard before anything measures: the standard decides the
+    # geometry, the frame rate and the pixel aspect that go into the file.
+    v4l2-ctl -d "$DEVICE" -i "$INPUT_N" >/dev/null 2>&1 \
+        || warn "could not select input $INPUT_N"
+    if [[ -n $STANDARD ]]; then
+        v4l2-ctl -d "$DEVICE" -s "$STANDARD" >/dev/null 2>&1 \
+            || warn "could not set the $STANDARD standard"
+    fi
+    settle
+
+    CAP_H=$(capture_height "$DEVICE")
+    case "$CAP_H" in
+        480) CAP_FPS="29.97"; CAP_PAR="8/9";   STD_NAME="NTSC" ;;
+        *)   CAP_FPS="25";    CAP_PAR="16/15"; STD_NAME="PAL"  ;;
+    esac
+    # Repairs a card something else has left scaled down; see pin_capture_format
+    # in lib/elgato-common.sh for why that is not theoretical.
+    read -r CAP_W CAP_H < <(pin_capture_format "$DEVICE")
+    msg "Input: $INPUT_NAME   Standard: $STD_NAME   ${CAP_W}x${CAP_H} @ ${CAP_FPS}fps"
+
+    # has_signal captures for itself, so a pass here has already proved frames
+    # are flowing. Only when it fails is it worth spending a second capture to
+    # find out which half went wrong.
+    if has_signal "$DEVICE"; then
+        msg "Picture: present"
+    elif delivers_frames "$DEVICE" 10 6; then
+        warn "Picture: NONE -- frames are arriving but carry no image."
+        warn "Check the lead is seated at both ends, the source is powered on,"
+        warn "and the standard is right (--pal / --ntsc). Recording anyway:"
+        warn "a tape parked on black looks exactly like this."
+    else
+        err_holders
+        return 1
+    fi
+
+    # Sound. Not fatal, ever: a picture without sound beats no recording.
+    if (( WANT_AUDIO )); then
+        AUDIO_NODE=$(find_audio_node)
+        if [[ -n $AUDIO_NODE ]]; then
+            AUDIO_RATE=$(audio_node_rate "$AUDIO_NODE")
+            AUDIO_CHANNELS=$(audio_node_channels "$AUDIO_NODE")
+            msg "Audio: $AUDIO_NODE (${AUDIO_RATE}Hz, ${AUDIO_CHANNELS}ch)"
+            if (( CHECK_ONLY )); then
+                local level; level=$(audio_level)
+                if [[ -n ${level:-} ]]; then
+                    msg "Audio level: ${level} dBFS$(awk -v l="$level" \
+                        'BEGIN { print (l < -60) ? "   (silent -- is the source playing?)" : "" }')"
+                else
+                    warn "Audio: could not measure the level"
+                fi
+            fi
+        else
+            warn "Audio: no Elgato source in PipeWire -- recording will be silent."
+            if ! command -v pw-cli >/dev/null || ! pw-cli info 0 >/dev/null 2>&1; then
+                warn "PipeWire is not reachable from this session at all. On a"
+                warn "machine with nobody logged in at the screen the user"
+                warn "services do not start; this makes them:"
+                warn "    sudo loginctl enable-linger $USER"
+            else
+                warn "PipeWire is running but has no capture node. The USB link"
+                warn "may be wedged -- try:  ${0##*/} --reset  or  elgato-doctor"
+            fi
+            AUDIO_NODE=""
+        fi
+    else
+        msg "Audio: off (--no-audio)"
+    fi
+
+    # Room to write it.
+    local dir free need_mb
+    # The output directory may not exist yet -- it is created when a recording
+    # actually starts, not for --check -- so ask about the nearest ancestor
+    # that does. Same filesystem either way.
+    dir=$(dirname "$OUTPUT")
+    local probe=$dir
+    while [[ ! -d $probe && $probe == */* ]]; do probe=${probe%/*}; done
+    free=$(df -B1 --output=avail "${probe:-/}" 2>/dev/null | tail -1)
+    [[ $free =~ ^[0-9]+$ ]] || free=0
+    if (( free > 0 && free < 1073741824 )); then
+        err "only $(human "$free") free in $dir -- not enough to start"
+        return 1
+    fi
+    if (( DURATION > 0 )); then
+        need_mb=$(awk -v s="$DURATION" -v r="${MB_PER_SEC[$CODEC]}" \
+                      'BEGIN { printf "%d", s * r }')
+        msg "Disk: $(human "$free") free, about $(human $(( need_mb * 1048576 ))) needed for $(mmss "$DURATION")"
+        if (( need_mb * 1048576 > free )); then
+            warn "that does not fit. The recording will stop cleanly when the"
+            warn "disk is nearly full rather than fail, but it will be short."
+        fi
+    else
+        msg "Disk: $(human "$free") free -- about $(mmss $(awk -v f="$free" \
+            -v r="${MB_PER_SEC[$CODEC]}" 'BEGIN { printf "%d", f / 1048576 / r }')) of $CODEC"
+    fi
+    return $rc
+}
+
+err() { printf '%sxx%s %s\n' "$E_RED" "$E_OFF" "$*" >&2; }
+
+# Who holds THIS node, by name, without pulling in psmisc for fuser.
+#
+# Deliberately not device_holders() from lib/elgato-common.sh: that one walks
+# every /dev/video*, /dev/vbi* and /dev/snd/controlC*, which is what
+# elgato-doctor wants and exactly wrong here -- PipeWire holds the ALSA control
+# nodes as a matter of course, so it would name PipeWire as the thing keeping
+# the camera busy every single time.
+holders_of() {
+    local target fd pid out="" names=""
+    target=$(readlink -f "$1")
+    for fd in /proc/[0-9]*/fd/*; do
+        [[ $(readlink -f "$fd" 2>/dev/null) == "$target" ]] || continue
+        pid=${fd#/proc/}; pid=${pid%%/*}
+        [[ $pid == "$$" ]] && continue
+        [[ " $out " == *" $pid "* ]] && continue    # one process, many fds
+        out+="$pid "
+        names+="$(cat "/proc/$pid/comm" 2>/dev/null)($pid) "
+    done
+    echo "${names% }"
+}
+
+err_holders() {
+    err "the device is not delivering frames"
+    local holders; holders=$(holders_of "$DEVICE")
+    if [[ -n $holders ]]; then
+        err "something else has it open -- only one program can: $holders"
+        err "stop it first, or record from the viewer's share node instead:"
+        err "    elgato-viewer --share   then   ${0##*/} -d /dev/elgato-share"
+    elif (( $(usb_errors_since_plug) > 0 )); then
+        err "the USB link is wedged -- power-cycle it:  ${0##*/} --reset"
+    else
+        err "check the source is on and the standard is right (--pal / --ntsc)"
+        err "for a full diagnosis:  elgato-doctor"
+    fi
+}
+
+# ------------------------------------------------------------------ main ----
+
+if is_recording; then
+    die "a recording is already running ($(do_status)) -- only one program can have the card"
+fi
+
+if (( DO_RESET )); then
+    reset_helper="$SELF_DIR/elgato-reset"
+    [[ -x $reset_helper ]] || die "elgato-reset not found next to this script"
+    msg "Power-cycling the capture box"
+    "$reset_helper" || warn "reset reported a problem; carrying on"
+    settle
+fi
+
+# Decide the filename before the preflight, so the disk check looks at the
+# directory the file is actually going to.
+if [[ -z $OUTPUT ]]; then
+    stamp=$(date +%Y%m%d-%H%M%S)
+    OUTPUT="$RECORD_DIR/elgato-$stamp.mkv"
+    n=2
+    while [[ -e $OUTPUT ]]; do
+        OUTPUT="$RECORD_DIR/elgato-$stamp-$n.mkv"
+        n=$(( n + 1 ))
+    done
+else
+    OUTPUT=${OUTPUT/#\~/$HOME}
+    [[ -e $OUTPUT ]] && die "$OUTPUT exists -- refusing to overwrite a recording"
+fi
+
+preflight || exit 1
+
+if (( CHECK_ONLY )); then
+    msg "Ready. Would write $OUTPUT"
+    msg "Frame count is not picture quality on this card: run"
+    msg "    elgato-viewer --verify      # needs no display either"
+    msg "if you want to know the picture is not tearing before a long capture."
+    exit 0
+fi
+
+mkdir -p "$(dirname "$OUTPUT")" || die "cannot create $(dirname "$OUTPUT")"
+
+# The preflight has just had the device open, and this chip fails transiently
+# when it is opened again immediately -- see the note beside settle() in
+# lib/elgato-common.sh. Nothing in the kernel log, no USB error, just a
+# recording that would not start.
+settle
+
+mkdir -p "$RUN_DIR"
+echo $$ > "$PID_FILE"
+{
+    echo "pid=$$"
+    echo "output=$OUTPUT"
+    echo "started=$(date +%s)"
+    echo "codec=$CODEC"
+} > "$STATE_FILE"
+
+CHILD=""
+
+# Forward the signal and then get out of the way: the engine turns it into an
+# EOS, waits for the muxer to write its index and exits on its own. Killing the
+# child here, or exiting and leaving it orphaned, is what produces a file with
+# no duration.
+# SIGTERM to the engine whichever signal arrived here: it treats INT, TERM and
+# HUP alike, and TERM is the one that is never ignored on the way in.
+on_signal() { [[ -n $CHILD ]] && kill -TERM "$CHILD" 2>/dev/null; }
+cleanup()   { rm -f "$PID_FILE" "$STATE_FILE"; }
+
+trap on_signal INT TERM HUP
+trap cleanup EXIT
+
+"$RECORDER" \
+    --device "$DEVICE" \
+    --output "$OUTPUT" \
+    --codec "$CODEC" \
+    --duration "$DURATION" \
+    --width "$CAP_W" --height "$CAP_H" \
+    --fps "$CAP_FPS" --par "$CAP_PAR" \
+    --field-order "$FIELD_CAPS" \
+    --audio-node "$AUDIO_NODE" \
+    --audio-rate "$AUDIO_RATE" \
+    --audio-channels "$AUDIO_CHANNELS" \
+    --av-offset "$AV_OFFSET" \
+    $( ((QUIET)) && echo --quiet ) \
+    $( ((DEBUG)) && echo --debug ) &
+CHILD=$!
+
+# A trapped signal makes wait return early while the child is still finishing
+# its file; keep waiting until the child is genuinely gone, so that the exit
+# status is its own and the report has been printed before this returns.
+rc=0
+while kill -0 "$CHILD" 2>/dev/null; do
+    wait "$CHILD"; rc=$?
+done
+exit $rc

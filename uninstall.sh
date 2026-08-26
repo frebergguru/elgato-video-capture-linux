@@ -22,8 +22,8 @@ set -uo pipefail
 
 SELF_DIR=$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd)
 KVER=$(uname -r)
-TOOLS=(elgato-viewer elgato-audio elgato-doctor elgato-reset elgato-obs-setup
-       elgato-driver)
+TOOLS=(elgato-viewer elgato-record elgato-audio elgato-doctor elgato-reset
+       elgato-obs-setup elgato-driver)
 BIN_DIR="$HOME/.local/bin"
 WP_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/wireplumber/wireplumber.conf.d/51-elgato-not-default.conf"
 UDEV_RULE=/etc/udev/rules.d/70-elgato-video-capture.rules

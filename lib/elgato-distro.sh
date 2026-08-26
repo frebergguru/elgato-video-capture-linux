@@ -208,6 +208,15 @@ pkg_for() {
         pacman:python)           echo "python" ;;
         *:python)                echo "python3" ;;
 
+        pacman:python-gobject)   echo "python-gobject" ;;
+        apt-get:python-gobject)  echo "python3-gi" ;;
+        dnf:python-gobject|dnf5:python-gobject|yum:python-gobject) echo "python3-gobject" ;;
+        zypper:python-gobject)   echo "python3-gobject" ;;
+        xbps-install:python-gobject) echo "python3-gobject" ;;
+        emerge:python-gobject)   echo "dev-python/pygobject" ;;
+        apk:python-gobject)      echo "py3-gobject3" ;;
+        eopkg:python-gobject)    echo "python3-gobject" ;;
+
         pacman:v4l2loopback)     echo "dkms v4l2loopback-dkms v4l2loopback-utils" ;;
         apt-get:v4l2loopback)    echo "v4l2loopback-dkms v4l2loopback-utils" ;;
         dnf:v4l2loopback|dnf5:v4l2loopback|yum:v4l2loopback) echo "akmod-v4l2loopback" ;;

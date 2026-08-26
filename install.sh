@@ -32,8 +32,8 @@ set -uo pipefail
 
 SELF_DIR=$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd)
 KVER=$(uname -r)
-TOOLS=(elgato-viewer elgato-audio elgato-doctor elgato-reset elgato-obs-setup
-       elgato-driver)
+TOOLS=(elgato-viewer elgato-record elgato-audio elgato-doctor elgato-reset
+       elgato-obs-setup elgato-driver)
 
 if [[ -t 1 ]]; then
     G=$'\033[1;32m'; Y=$'\033[1;33m'; R=$'\033[1;31m'; O=$'\033[0m'
@@ -90,10 +90,15 @@ check_tool gst-launch-1.0 gstreamer
 check_tool pw-loopback    pipewire
 check_tool python3        python
 
-# Optional, and only for elgato-viewer's r key: the viewer plays perfectly
-# without them and says which one is missing if you press r.
+# Optional, and only for recording: the viewer plays perfectly without them and
+# says which one is missing if you press r.
 gst-inspect-1.0 avenc_ffv1 >/dev/null 2>&1 \
-    || advise_missing "the FFV1 encoder ('elgato-viewer' plays fine, but r cannot record)" gst-libav
+    || advise_missing "the FFV1 encoder ('elgato-viewer' plays fine, but r and elgato-record cannot record)" gst-libav
+
+# elgato-record needs PyGObject -- but not GTK, which is what lets it run over
+# SSH. The viewer's keys need both; without them it still plays.
+python3 -c 'import gi' >/dev/null 2>&1 \
+    || advise_missing "PyGObject ('elgato-record' and the viewer's keys need it)" python-gobject
 
 # Releasing the module needs whatever has the ALSA card open to let go. The
 # capture card registers an ALSA device, and WirePlumber holds its control
@@ -340,4 +345,5 @@ fi
 echo
 msg "Done. Check it with:   elgato-viewer --verify"
 msg "Then play with:        elgato-viewer"
+msg "Or record headless:    elgato-record -t 30m"
 msg "If anything is off:    elgato-doctor"
