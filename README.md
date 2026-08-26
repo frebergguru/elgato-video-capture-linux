@@ -43,6 +43,21 @@ The patched driver programs `HTL_CTRL` and `PLL_CTRL`, behind `elgato_htl=2`:
 Measured over 750 frames across six consecutive runs, and confirmed by eye.
 `install.sh` sets it permanently in `/etc/modprobe.d/cx231xx.conf`.
 
+To see this for yourself rather than take the table on trust, run
+`tools/htl-ab` from a terminal. It power-cycles the card before each setting,
+shows the decoder registers each one actually produced, and opens the live
+picture so you can look at it. The power cycle is the part that matters:
+writing `elgato_htl=0` back does **not** un-program `HTL_CTRL`, it only stops
+the driver writing it, so a hand-rolled A/B without one shows every setting as
+perfect once any of them has locked the decoder. The tool runs `elgato_htl=0`
+first as a positive control — if the picture does not tear there, your source
+does not provoke the fault and no comparison after it means anything.
+
+`elgato_htl=1` and `elgato_htl=2` are the same thing, incidentally: the
+lock-acquire routine `2` was meant to add cannot run and could not contribute
+if it did. See `cx231xx_elgato_v2_acquire_lock()` in
+`driver/cx231xx/cx231xx-avcore.c`.
+
 **The fix lives in the kernel module.** `elgato-viewer` cannot compensate for
 it — corrupt frames arrive at exactly 25fps with exactly the right byte count,
 carrying data spliced from several moments. If you install with

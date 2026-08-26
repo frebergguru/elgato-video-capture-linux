@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Copyright (C) 2026 Hypnotize
+# htl-ab -- watch the picture under elgato_htl=0, 1 and 2, honestly.
+#
+# Not part of the installed set: this is for answering "does this knob actually
+# do anything", which needs root and a source that provokes the fault. Run it
+# from a terminal, since it asks for a password.
+#
+# THE DISCIPLINE THAT MAKES IT VALID is a USB power cycle before each setting.
+# Writing the parameter back to 0 does NOT un-program the registers an earlier
+# setting wrote -- it only stops the driver writing them, and once the decoder
+# is locked it stays locked. So a hand A/B of 2 then 1 shows both perfect
+# whatever the truth is. elgato-reset is the power cycle; it also zeroes every
+# elgato_* knob, which is why the setting under test is applied after it and
+# not before.
+#
+# elgato_htl=0 is run first on purpose. It is the positive control: if the
+# picture does not tear at 0, this source does not provoke the fault, and no
+# comparison below means anything about picture quality -- only the registers
+# will be informative. Do not skip it.
+#
+# This is also why "elgato-viewer --tune" cannot be trusted to rank these: it
+# applies a config by writing the parameter and re-setting the standard, with
+# no power cycle, so every config after the first inherits its lock.
+set -uo pipefail
+
+# readlink -f first, so this works through a symlink and from any directory.
+SELF_DIR=$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd)
+REPO=$(cd -- "$SELF_DIR/.." && pwd)
+cd -- "$REPO" || exit 1
+
+KNOB=/sys/module/cx231xx/parameters/elgato_htl
+REGS=/sys/module/cx231xx/parameters/elgato_regs
+DD=/sys/kernel/debug/dynamic_debug/control
+
+echo ":: taking your password once, so nothing prompts mid-test"
+sudo -v || exit 1
+
+# Restore on ANY exit, Ctrl-C included. Leaving 31 debug callsites enabled or
+# the knob on a test value is exactly the sort of thing that gets forgotten.
+cleanup() {
+    trap - EXIT INT TERM
+    echo
+    echo "================ tidy up ================"
+    sudo sh -c "echo 0 > $REGS" 2>/dev/null
+    sudo sh -c "echo 'file cx231xx-avcore.c -p' > $DD" 2>/dev/null
+    sudo sh -c "echo 2 > $KNOB" 2>/dev/null
+    v4l2-ctl -d /dev/elgato -i 0   >/dev/null 2>&1
+    v4l2-ctl -d /dev/elgato -s pal >/dev/null 2>&1
+    echo ":: back to elgato_htl=$(cat "$KNOB" 2>/dev/null), debug off"
+}
+trap cleanup EXIT INT TERM
+
+# Turn on the driver's own debug output, so 'lock acquired' / 'no lock after
+# 3 polls' would be visible if the lock-acquire routine ever ran.
+sudo sh -c "echo 'file cx231xx-avcore.c +p' > $DD" 2>/dev/null \
+    && echo ":: driver debug on" \
+    || echo "!! no dynamic debug (CONFIG_DYNAMIC_DEBUG off) -- registers still work"
+
+trial() {
+    # Two statements, not one: bash expands every word of a command before the
+    # builtin runs, so "local h=$1 mark=...$h..." expands $h while it is still
+    # unset -- which under set -u is fatal.
+    local h=$1
+    local mark="HTL-AB-$h-$RANDOM"
+    echo
+    echo "================ elgato_htl=$h ================"
+
+    echo ":: power-cycling so this starts from power-on registers"
+    "$REPO/bin/elgato-reset" >/dev/null 2>&1 || { echo "!! reset failed"; return 1; }
+
+    sudo sh -c "echo $h > $KNOB" || return 1
+    sudo sh -c "echo 1  > $REGS" || return 1
+    # A marker in the kernel log, so the dump below is this trial's and not a
+    # previous one's. Not fatal if it fails -- the readback falls back.
+    sudo sh -c "echo '$mark' > /dev/kmsg" 2>/dev/null
+
+    # The overrides are applied on a standard change; re-set the current one.
+    v4l2-ctl -d /dev/elgato -i 0   >/dev/null 2>&1
+    v4l2-ctl -d /dev/elgato -s pal >/dev/null 2>&1
+    sleep 2
+
+    echo ":: what the decoder actually ended up with"
+    local regs
+    regs=$(sudo dmesg 2>/dev/null | sed -n "/$mark/,\$p" \
+           | grep -oE 'elgato: (HTL_CTRL|PLL_CTRL|GEN_STAT).*' | sort -u)
+    # The marker is written to /dev/kmsg; if that did not land, fall back to
+    # the tail rather than printing nothing and looking like a clean result.
+    if [[ -z $regs ]]; then
+        regs=$(sudo dmesg 2>/dev/null \
+               | grep -oE 'elgato: (HTL_CTRL|PLL_CTRL|GEN_STAT).*' | tail -6 | sort -u)
+        [[ -n $regs ]] && echo "     (marker not found -- showing the most recent dump)"
+    fi
+    if [[ -n $regs ]]; then
+        printf '%s\n' "$regs" | sed 's/^/     /'
+    else
+        echo "     !! no register dump. Is dmesg readable? try: sudo dmesg | grep elgato:"
+    fi
+
+    local n
+    n=$(sudo dmesg | sed -n "/$mark/,\$p" \
+        | grep -cE 'lock acquired|no lock after 3 polls')
+    echo ":: lock-acquire routine ran? $n log lines  ($([[ $n -eq 0 ]] && echo NO || echo YES))"
+
+    echo ":: frame-integrity score"
+    "$REPO/bin/elgato-viewer" --verify 6 2>&1 | grep -E 'corrupt frames|VERDICT' | sed 's/^/     /'
+
+    echo
+    echo ":: opening the live picture -- look at it, then press q in the window"
+    "$REPO/bin/elgato-viewer"
+}
+
+# 0 first, deliberately. It is the positive control: if the picture does NOT
+# tear at 0 on your source, this source cannot tell the settings apart and
+# nothing below means anything. Seeing it tear is what makes 1 and 2 credible.
+trial 0
+read -rp "press Enter for elgato_htl=1 " _
+trial 1
+read -rp "press Enter for elgato_htl=2 " _
+trial 2
+
+echo
+cat <<'EOT'
+
+What to look for
+----------------
+  htl=0   HTL_CTRL 0x00002040, PLL_CTRL 0x161f0300   <- loop unprogrammed
+          You expect tearing here. If it looks fine, this source does not
+          provoke the fault and the two runs below prove nothing about
+          picture quality -- only the registers will be meaningful.
+
+  htl=1   HTL_CTRL 0x00000802, PLL_CTRL 0x161f1000   <- loop programmed
+  htl=2   HTL_CTRL 0x00000802, PLL_CTRL 0x161f1000   <- identical to htl=1
+
+If 1 and 2 print the same two registers, and "lock-acquire routine ran?"
+says NO under 2, then 2 is doing nothing that 1 does not already do.
+EOT
