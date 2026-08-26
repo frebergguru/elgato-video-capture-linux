@@ -25,6 +25,7 @@ works, and no amount of configuration changes it.
 | ------- | ------- |
 | the OBS source is black, log says `Failed to open device` | something else has it |
 | `elgato-viewer` says `Device or resource busy` | OBS has it |
+| `elgato-record` will not start | OBS or the viewer has it — `--share` is the way to have both |
 
 Who is holding it: `elgato-doctor`, which names the process, or `fuser -v /dev/elgato`.
 
@@ -121,6 +122,7 @@ route. Do not also capture Desktop Audio — see below.
 
 ```
 elgato-viewer          # then press r
+elgato-record -t 2h    # or no window at all, over SSH
 ```
 No OBS, no compositor, no scene graph — press `r` and the viewer writes the
 recording itself, straight off the same tee `--share` publishes from. What you
@@ -128,12 +130,21 @@ get is a Matroska file holding the frames exactly as the card delivered them:
 FFV1, lossless, still interlaced, with the capture audio muxed in. About 4.5
 MB/s on console output, more on noisy tape. `s` saves a single frame as a PNG.
 
-For archiving a tape this is the better route, not the fallback. OBS composites
-and re-encodes; this writes down what arrived and leaves every decision about
-deinterlacing and scaling to be made afterwards, once, without a clock running.
-What OBS is still better at is everything around the recording — scenes,
-overlays, a second source, streaming. See
-[Recording](README.md#recording) in the README for the formats and sizes.
+`elgato-record` is that same recording with the window taken out — the same
+encoders, the same muxer, the same file, and no GTK, no compositor and no
+display anywhere in it. That is the one to run over SSH or under `tmux` for a
+long tape; it also reports its frame count and finishes the file properly on
+Ctrl-C, SIGTERM or `elgato-record stop`. Note that it needs the card itself, so
+either close OBS or point it at the share node with `-d /dev/elgato-share`.
+
+For archiving a tape either of these is the better route, not the fallback. OBS
+composites and re-encodes; these write down what arrived and leave every
+decision about deinterlacing and scaling to be made afterwards, once, without a
+clock running. What OBS is still better at is everything around the recording —
+scenes, overlays, a second source, streaming. See
+[Recording](README.md#recording) and
+[Without a display](README.md#without-a-display) in the README for the formats,
+the sizes and the headless options.
 
 `elgato-viewer --record raw.yuv` is still there, and still writes headerless
 YUYV at about 21 MB/s. That is for feeding an analysis tool that wants raw
@@ -271,14 +282,14 @@ Output** to Advanced; nothing else in the setup depends on it.
 
 Note that what OBS records here is the picture *after* it has been
 deinterlaced, scaled and composited. If the recording is the point and you want
-the frames as the card sent them, `elgato-viewer`'s `r` key writes them
-losslessly instead — see [Neither](#neither) above.
+the frames as the card sent them, `elgato-viewer`'s `r` key and `elgato-record`
+both write them losslessly instead — see [Neither](#neither) above.
 
 ## If something is wrong
 
 | symptom | cause |
 | ------- | ----- |
-| source black, `Failed to open device` in the log | `elgato-viewer`, `elgato-doctor` or another OBS has the device |
+| source black, `Failed to open device` in the log | `elgato-viewer`, `elgato-record`, `elgato-doctor` or another OBS has the device |
 | source black, device opens fine | no signal — check the yellow RCA, and the standard (`--pal` / `--ntsc`) |
 | `Selected video format not supported` | resolution or frame rate is not *Leave Unchanged* |
 | picture tears with rainbow striping | `elgato_htl` is not 2. `cat /sys/module/cx231xx/parameters/elgato_htl` |

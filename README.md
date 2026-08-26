@@ -8,7 +8,7 @@ tearing the stock driver produces.
 ```
 ./install.sh             # build + install the driver, rules and launchers
 elgato-viewer            # play
-elgato-viewer --verify   # prove the picture is clean
+elgato-viewer --verify   # measure frame integrity (read its caveats below)
 elgato-record -t 2h      # capture a tape, no display needed
 ```
 
@@ -79,9 +79,11 @@ libexec/elgato-recorder.py  the headless recording engine, no GTK
 libexec/elgato_recording.py  what a recording IS -- shared by both of those
 lib/elgato-common.sh  shared helpers for the elgato-* helper scripts
 lib/elgato-distro.sh  package names, root, module paths, per distribution
+tools/htl-ab        A/B the elgato_htl knob honestly -- not installed, needs root
 driver/cx231xx/     patched cx231xx source
 driver/patches/     every deviation from the stock kernel tree, with rationale
 etc/                udev, modprobe, modules-load and WirePlumber configuration
+install.sh          build and install all of the above; uninstall.sh undoes it
 LICENSE             GPL-2.0-or-later, full text
 OBS.md              using OBS with this card, and alongside elgato-viewer
 ```
@@ -224,12 +226,13 @@ lip-sync correction — applies unchanged.
 | `--no-audio` | leave the capture sound out of the file |
 | `--av-offset MS` | bake in a lip-sync correction, as `--record-av-offset` does |
 | `--field-order F` | `top` (default) \| `bottom` |
-| `-i`, `--input WHICH` | `composite` (default) \| `svideo` |
+| `-i`, `--input WHICH` | `composite` (default) \| `svideo` \| `0` \| `1` |
 | `--pal` / `--ntsc` | force the TV standard |
-| `-d`, `--device PATH` | V4L2 node (default: autodetect) |
+| `-d`, `--device PATH` | V4L2 node (default: autodetect, preferring `/dev/elgato`) |
 | `--reset` | power-cycle the capture box first |
 | `--check` | run the preflight and exit without recording |
-| `-q`, `--quiet` | no progress line |
+| `-q`, `--quiet` | no progress line; messages and the final report only |
+| `--debug` | print GStreamer's debug detail on an error |
 
 **Stopping it is the part that matters.** matroskamux writes its index and
 duration when the stream *ends*, so a recording has to be finished rather than
@@ -264,7 +267,7 @@ That last line is a claim about *capture*, not about picture: this card
 delivers corrupt frames at exactly the right rate, so a full frame count proves
 the driver kept up and nothing more. `elgato-viewer --verify` measures the
 other half and needs no display either — worth running before committing to a
-two-hour capture.
+two-hour capture, with the caveats in [Measuring](#measuring).
 
 The frame count is counted where the frames arrive from the card, and the queue
 below it does not leak. That is the one deliberate difference from the viewer's
@@ -458,19 +461,43 @@ sudo elgato-viewer --tune   # sweep the driver's elgato_* knobs
 ```
 
 `--verify` measures chroma coherence between lines: corrupt frames stripe in
-colour, a clean picture has flat colour fields. It was validated against
-frames inspected by eye (clean 2.6, corrupt 13.5) after three earlier metrics
-gave false passes. Validate any replacement the same way.
+colour, a clean picture has flat colour fields. It was validated against frames
+inspected by eye — clean scored 2.6, corrupt 13.5 — on flat-colour graphics
+from a games console, after three earlier metrics gave false passes. Validate
+any replacement the same way.
 
-One caveat worth knowing: the threshold was calibrated on flat-colour graphics
-from a games console. Film and tape content — VHS, DVD, camcorder footage —
-varies more from line to line by nature, so the figure may read high even on a
+**A pass is not proof.** The figure is a frame *average* tested against an
+absolute threshold, and the scale of the statistic depends on the content while
+the threshold does not, so damage confined to part of a dark picture is diluted
+away. Measured, on a console title screen: `elgato_htl=0` scored **0.0%
+corrupt** while PNG stills of that very capture were sheared diagonally with
+the text duplicated at a horizontal offset — 20 frames out of 20, across two
+independent power cycles. `--verify` says this next to every verdict it passes.
+Look at the picture, or save a still with `s`, before believing a clean score;
+`tools/htl-ab` exists because of exactly this.
+
+It reads high in the other direction too. The threshold was calibrated on
+flat-colour graphics, and film and tape content — VHS, DVD, camcorder footage —
+varies more from line to line by nature, so the percentage may look bad on a
 healthy capture. Judge by whether the reported chroma spread is *bimodal*
 (clean frames clustering low, corrupt ones clustering far above) rather than by
 the percentage alone, and raise `THRESH` in the script if your material needs
 it.
 
-It also refuses to pass judgement when the input is black: a disconnected or
+Beside the mean it reports the worst 5% of samples, which is where the damage
+actually shows. That number is **uncalibrated on purpose** and no verdict rests
+on it: a known-good capture measures about 14 on it, read from raw YUYV, so the
+mean's threshold of 9 emphatically does not transfer. Use it to compare two
+runs of your own, nothing more. (Computing it from PNG stills instead makes it
+look like a clean separator — 2.5 good against 20.9 torn — but that is
+GStreamer's YUYV-to-RGB conversion interpolating chroma and smoothing exactly
+the differences being measured.)
+
+The threshold and the percentage are deliberately left where they are: every
+measurement in this repository was taken with them, and redefining them
+silently would invalidate the lot.
+
+It refuses to pass judgement when the input is black: a disconnected or
 powered-off source has perfectly coherent chroma and would otherwise score a
 clean 0%.
 
@@ -498,6 +525,19 @@ own figure in the other pass — a difference that does not survive both passes
 is drift in the source material, not an effect of the setting. A single
 pass is not evidence: the winning configuration looked broken in pass 1.
 
+**The sweep still measures the wrong thing, and the passes do not fix it.** It
+applies a configuration by writing the module parameter and re-setting the
+standard, which cannot undo what an earlier configuration already wrote to the
+decoder — the same persistence `elgato-reset` exists for. So once any
+configuration has locked the decoder, every later one inherits the lock and
+scores as though it had earned it: measured, with `elgato_htl=2` applied first,
+going back to `elgato_htl=0` still reported 0.0% corrupt, twice. Interleaving
+guards against drift; this is one-way contamination, which it does not catch.
+To rank configurations honestly, power-cycle between each — `elgato-reset` then
+`elgato-viewer --verify`, once per configuration — which is what `tools/htl-ab`
+does for `elgato_htl`. And read the blind spot above before reading any row:
+a low figure is not evidence that a configuration is good.
+
 ## If something is wrong
 
 Run `elgato-doctor` first; it checks the whole chain and says which link failed.
@@ -505,6 +545,7 @@ Run `elgato-doctor` first; it checks the whole chain and says which link failed.
 | symptom | cause |
 | ------- | ----- |
 | picture tears, ~60% of frames | `elgato_htl` is not 2 — `elgato-viewer` warns about this |
+| the picture is visibly torn but `--verify` says 0.0% | that is its known blind spot, not a healthy capture — see [Measuring](#measuring) |
 | no frames, `cannot change alt number` | USB link wedged — `elgato-viewer --reset` |
 | frames but no picture | check the yellow RCA at both ends, and `--ntsc`/`--pal` |
 | captured audio in voice chat | WirePlumber rule missing — re-run `install.sh` |
@@ -521,7 +562,9 @@ values.
 
 ## Retired experiments
 
-Kept in `driver/patches/`, defaulting to off, as recorded negative results:
+Kept in the tree as recorded negative results — the module parameters are in
+`driver/patches/` and default to off, and the dead routine is left where it is
+with the reasoning above it:
 
 | experiment | result |
 | ---------- | ------ |
@@ -529,6 +572,7 @@ Kept in `driver/patches/`, defaulting to off, as recorded negative results:
 | `elgato_fielddebounce` | **cannot work** — no frames delivered at all |
 | bulk instead of isochronous | identical; bandwidth starvation excluded |
 | `elgato_timing`, `elgato_modectrl` | no improvement |
+| the lock-acquire routine `elgato_htl=2` was meant to add | **unreachable, and could not help** — see `cx231xx-avcore.c` |
 
 Also excluded by measurement: USB packet loss (`err=0 eproto=0` over 2M
 packets) and false `FF 00 00` SAV codes in the payload (no `0x00` or `0xFF`
@@ -550,7 +594,8 @@ applied — see above.
 
 Kernel headers for the running kernel, a C compiler and `make` to build the
 module against them, `v4l-utils`, GStreamer (`base`, `good` and a Wayland or
-X11 sink), PipeWire with `pw-loopback`, and `python3` for `--verify`. Being
+X11 sink), PipeWire with `pw-loopback`, and `python3` — which `--verify`,
+`--quality`, the viewer's window and `elgato-record` all use. Being
 out-of-tree, the module taints the kernel whatever else is true of it, and
 under Secure Boot it has to be signed — see [Distributions](#distributions).
 
