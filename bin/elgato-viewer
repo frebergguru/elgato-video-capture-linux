@@ -939,6 +939,23 @@ tune_sweep() {
     warn "setting the parameters back to 0 does NOT restore the old register"
     warn "values -- only a power cycle does. Recover with:  elgato-reset"
     echo
+    warn "READ THIS BEFORE TRUSTING THE TABLE. That same persistence is what"
+    warn "makes the sweep measure the wrong thing. A config is applied by"
+    warn "writing the parameter and re-setting the standard, and that cannot"
+    warn "undo what an earlier config already wrote -- so once any config has"
+    warn "locked the decoder, every later one inherits the lock and scores as"
+    warn "though it had earned it. Measured: with elgato_htl=2 applied first,"
+    warn "going back to elgato_htl=0 still reported 0.0% corrupt, twice."
+    warn "Interleaving the passes does not help. Drift is what the passes"
+    warn "guard against; this is one-way contamination, which they do not."
+    warn "To compare configurations honestly, power-cycle between each:"
+    warn "    elgato-reset  then  elgato-viewer --verify   once per config."
+    echo
+    warn "And check the sweep can see anything at all before reading into it:"
+    warn "a source that does not provoke the fault scores 0.0% on every config,"
+    warn "including elgato_htl=0. Confirm elgato_htl=0 measures BADLY on your"
+    warn "source -- from a power cycle -- or the table below is all noise."
+    echo
     msg "Sweeping ${#TUNE_CONFIGS[@]} configurations (~20s each)."
     msg "Figure is % of frames corrupt; <= 5% means the picture is stable."
     echo

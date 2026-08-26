@@ -33,8 +33,7 @@ rainbow striping. The cause is not USB, not bandwidth, and not the player:
 > time-lock loop**. SAV-to-SAV line lengths hunt instead of holding constant,
 > so every line is sampled at a different horizontal phase.
 
-The patched driver programs `HTL_CTRL` and `PLL_CTRL` and runs a lock-acquire
-routine, behind `elgato_htl=2`:
+The patched driver programs `HTL_CTRL` and `PLL_CTRL`, behind `elgato_htl=2`:
 
 | `elgato_htl` | frames corrupt |
 | ------------ | -------------- |

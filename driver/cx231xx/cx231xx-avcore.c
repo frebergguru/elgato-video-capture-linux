@@ -988,21 +988,22 @@ EXPORT_SYMBOL_GPL(cx231xx_disable656);
  *	HTL_CTRL (0x498)   horizontal time lock loop constants
  *	PLL_CTRL (0x494)   sampling PLL maximum offset
  *
- * A lock-acquire step forces the HTL loop constants, then polls GEN_STAT
- * until the decoder reports video present and AGC locked before restoring
- * them.  Under Linux both registers keep their power-on defaults and nothing
- * ever re-acquires the lock.  That is the
- * one mechanism left that fits the symptom this box shows (observed with a
- * games console, but the mechanism is not specific to one kind of source):
- * SAV to
- * SAV line lengths that hunt between 1444 and 1636 bytes instead of holding
- * constant, so every field is sampled at a different horizontal phase.
+ * Under Linux both registers keep their power-on defaults, so the loop
+ * constants are never programmed.  That is the one mechanism left that fits
+ * the symptom this box shows (observed with a games console, but the mechanism
+ * is not specific to one kind of source): SAV-to-SAV line lengths that hunt
+ * between 1444 and 1636 bytes instead of holding constant, so every field is
+ * sampled at a different horizontal phase.
+ *
+ * Programming them is what fixes it, and that is cx231xx_elgato_v2_htl().
+ * A separate lock-acquire step was also tried; see
+ * cx231xx_elgato_v2_acquire_lock() for why it cannot contribute anything.
  */
 
 static int elgato_htl;
 module_param(elgato_htl, int, 0644);
 MODULE_PARM_DESC(elgato_htl,
-	"Elgato V2: horizontal lock loop. 1 = set HTL_CTRL/PLL_CTRL constants, 2 = also run the lock-acquire routine");
+	"Elgato V2: horizontal lock loop. 1 = set HTL_CTRL/PLL_CTRL constants; 2 is accepted and behaves identically (see cx231xx_elgato_v2_acquire_lock)");
 
 static int elgato_vdrst;
 module_param(elgato_vdrst, int, 0644);
@@ -1078,9 +1079,41 @@ static void cx231xx_elgato_v2_htl(struct cx231xx *dev)
  * is put back; if the decoder never reports a lock the forced constants are
  * left in place.
  *
- * This is gated on one particular input selection upstream; here it runs
- * whenever it is asked to, since this board only ever has composite and
- * S-Video wired up.
+ * RETIRED -- UNREACHABLE, AND CANNOT HELP, 2026-08-26.  Kept as a recorded
+ * negative result, in the same spirit as elgato_progressive and
+ * elgato_fielddebounce in cx231xx-video.c.
+ *
+ * Unreachable: cx231xx_elgato_v2_overrides() calls _htl() before this, and
+ * _htl() leaves HTL_CTRL[19:0] at exactly 0x00802 -- so the guard below sees
+ * (saved & 0xffff) == 0x802 and returns immediately, for every possible prior
+ * register value.  Measured rather than reasoned: with dynamic debug enabled
+ * on this file and elgato_htl=2 across a USB power cycle, 31 callsites live
+ * and the register dump printing freely, neither dev_dbg() below ever fired.
+ * elgato_htl=1 and elgato_htl=2 are therefore the same thing.
+ *
+ * Cannot help: the fault is not the guard, it is that this routine and _htl()
+ * want opposite things.  This one forces the constants *temporarily* and hands
+ * the originals back once the decoder reports lock; _htl() forces them for
+ * good.  Measured on this unit, GEN_STAT reads 0x00779400 -- VPRES and
+ * AGC_LOCK both already asserted -- so the poll below succeeds on its first
+ * iteration and goes straight to the restore.  Every ordering then lands on
+ * the same final register state:
+ *
+ *	guard removed, still after _htl():  saved is 0x802, restore is a no-op
+ *	hoisted ahead of _htl():            restores 0x2040, _htl() re-forces
+ *	poll fails three times:             leaves 0x802, which is _htl()'s job
+ *
+ * HTL_CTRL ends at 0x00000802 in all of them.  The only thing running it adds
+ * is a 25ms delay on every standard change.
+ *
+ * The picture metric cannot arbitrate this and was not asked to: on the source
+ * available when this was measured, elgato_htl=0 already scored 0.0% of frames
+ * corrupt over 8 runs of 150 frames, so that source does not exercise the
+ * tearing fault at all.  The register trace above does not depend on the
+ * source.
+ *
+ * If it is ever revived, it has to *replace* _htl(), not follow it, and it
+ * needs a decoder that does not already report lock.
  */
 static void cx231xx_elgato_v2_acquire_lock(struct cx231xx *dev)
 {
