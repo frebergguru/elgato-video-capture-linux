@@ -417,6 +417,26 @@ delivers_frames() {
         --stream-to=/dev/null >/dev/null 2>&1
 }
 
+# Put the card back on the standard's full frame before measuring anything.
+#
+# This chip implements S_FMT scaling, so whatever geometry it was last asked
+# for is the geometry it is still in -- a standard change does not reset it.
+# The measuring paths below all read the format rather than setting it, so
+# anything that has previously asked the card for a smaller picture silently
+# redefines what --verify and --quality are scoring: a --verify that announces
+# "180x144" is measuring the hardware scaler, not the driver's frame assembly.
+#
+# Pinning here rather than trusting G_FMT makes the figures mean what they say,
+# and repairs a card something else has shrunk. It is a no-op in the normal
+# case, where the card is already on its full frame.
+pin_capture_format() {
+    local dev=$1 h=576
+    case "$(v4l2-ctl -d "$dev" --get-standard 2>/dev/null)" in
+        *NTSC*|*PAL-M*|*PAL-60*) h=480 ;;
+    esac
+    v4l2-ctl -d "$dev" --set-fmt-video=width=720,height=$h >/dev/null 2>&1
+}
+
 # Frames arriving proves the USB path works, not that anything is plugged into
 # the yellow socket: with no source the decoder free-runs and emits a flat
 # blanking level at the nominal rate. A near-zero spread across the luma plane
@@ -424,6 +444,7 @@ delivers_frames() {
 has_picture() {
     local dev=$1 raw spread
     raw=$(mktemp) || return 0
+    pin_capture_format "$dev"
     if ! timeout 8 v4l2-ctl -d "$dev" --stream-mmap --stream-count=8 \
             --stream-to="$raw" >/dev/null 2>&1; then
         rm -f "$raw"; return 0
@@ -569,6 +590,7 @@ cleanup() {
 
 verify_stream() {
     local dev=$1 secs=$2 raw w h sz
+    pin_capture_format "$dev"
     read -r w h sz < <(v4l2-ctl -d "$dev" --get-fmt-video 2>/dev/null | awk '
         /Width\/Height/ { split($3, a, "/"); w = a[1]; h = a[2] }
         /Size Image/     { sz = $4 }
@@ -691,6 +713,7 @@ PYEOF
 # 34.0 -> 19.2. A single "quality score" would happily optimise for mush.
 quality_stream() {
     local dev=$1 secs=$2 raw w h sz
+    pin_capture_format "$dev"
     read -r w h sz < <(v4l2-ctl -d "$dev" --get-fmt-video 2>/dev/null | awk '
         /Width\/Height/ { split($3, a, "/"); w = a[1]; h = a[2] }
         /Size Image/     { sz = $4 }

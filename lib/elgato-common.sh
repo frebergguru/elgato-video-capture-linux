@@ -101,6 +101,38 @@ input_status() {
     v4l2-ctl -d "$dev" --get-input 2>/dev/null | sed -n 's/.*(\(.*\)).*/\1/p'
 }
 
+# --- capture geometry -------------------------------------------------------
+# This chip implements VIDIOC_S_FMT scaling: it will happily hand over 180x144
+# if asked, and it STAYS there until something sets it back. A standard change
+# does not reset it -- measured.
+#
+# That makes a measuring pipeline dangerous. GStreamer negotiates downstream
+# caps upstream, so a probe that scales to 180x144 for its own convenience has
+# that size fixated on v4l2src and written into the device, and every later
+# capture inherits it: elgato-viewer --verify then scores the hardware scaler
+# instead of the driver, and OBS opens a 180x144 camera. Measuring must never
+# reconfigure the card.
+#
+# So the probes below pin the standard's full frame twice over: once with
+# v4l2-ctl before settling, which is also what repairs a card something else
+# has already shrunk, and once as explicit source caps, which stops the
+# downstream scaler's request from reaching the device at all.
+capture_height() {
+    case "$(v4l2-ctl -d "$1" --get-standard 2>/dev/null)" in
+        *NTSC*|*PAL-M*|*PAL-60*) echo 480 ;;
+        *)                       echo 576 ;;
+    esac
+}
+
+# pin_capture_format DEV -> prints "720 <height>" and leaves the device on it.
+# The card only ever samples 720 across, in either standard.
+pin_capture_format() {
+    local dev=$1 h
+    h=$(capture_height "$dev")
+    v4l2-ctl -d "$dev" --set-fmt-video=width=720,height="$h" >/dev/null 2>&1
+    echo "720 $h"
+}
+
 # The chip needs a moment between streaming sessions. Opening it again
 # immediately after a previous capture closed fails transiently, with no USB
 # error and nothing in the kernel log -- which would otherwise show up as a
@@ -127,18 +159,25 @@ delivers_frames() {
 # has_signal DEV -> 0 if the captured frames look like a real picture
 #
 # Frames arriving is NOT proof of a signal. With nothing connected the decoder
-# free-runs and happily emits rolling noise -- measured at mean luma ~22,
-# stdev ~5, max 34 on this unit. Any real picture is far brighter and far more
-# varied, so check the pixels rather than trusting the frame count.
+# emits a constant blanking level at the nominal rate -- measured on this unit
+# with elgato_htl=2: every pixel of every frame exactly 35, stdev 0.000. (An
+# earlier note here described rolling noise at mean ~22, stdev ~5; that was
+# measured before the horizontal-lock fix and no longer holds.) Any real
+# picture is far brighter and far more varied, so check the pixels rather than
+# trusting the frame count.
 SIGNAL_MIN_PEAK=${SIGNAL_MIN_PEAK:-80}
 SIGNAL_MIN_STDEV=${SIGNAL_MIN_STDEV:-12}
 
 has_signal() {
-    local dev=$1 tmp rc
+    local dev=$1 tmp rc w h
     tmp=$(mktemp -d) || return 1
+    read -r w h < <(pin_capture_format "$dev")
     settle
 
+    # The source caps are pinned: without them the 180x144 the scaler wants is
+    # negotiated into the device and left there. See pin_capture_format.
     timeout 8 gst-launch-1.0 -q v4l2src device="$dev" io-mode=mmap num-buffers=8 \
+        ! video/x-raw,width="$w",height="$h" \
         ! videoconvert ! video/x-raw,format=GRAY8 \
         ! videoscale ! video/x-raw,format=GRAY8,width=180,height=144 \
         ! multifilesink location="$tmp/f%02d.gray" >/dev/null 2>&1
@@ -160,10 +199,10 @@ sys.exit(0 if (peak >= peak_min and stdev >= stdev_min) else 1)
 PY
     rc=$?
     rm -rf "$tmp"
-    # rc 2 = no frames at all. That is at least as broken as flat output, so
-    # treat it as hung rather than as "fine" -- the earlier version only tested
-    # for flat frames and reported a dead device as healthy.
-    [[ $rc -eq 2 ]] && return 0
+    # No frames at all exits 1 above, the same as flat frames do: either way
+    # there is no picture, which is what this function answers. (A branch here
+    # used to remap an exit status of 2 to success; the script above has never
+    # produced one, so it never ran.)
     return $rc
 }
 
@@ -522,13 +561,27 @@ usb_reset_elgato() {
 }
 
 # Is the decoder emitting a flat blanking level rather than real video?
-# std == 0 across a frame means hung; genuine loss of signal still shows noise.
+#
+# CAUTION: this no longer distinguishes what it was written to distinguish. It
+# assumed a genuine loss of signal still shows noise, so that a mathematically
+# flat frame could only mean a wedged decoder. With elgato_htl=2 an
+# unconnected input is flat too -- measured, every pixel exactly 35 and stdev
+# 0.000, which is the same signature the wedged-decoder note in
+# usb_reset_elgato describes. A healthy card with nothing plugged into it now
+# answers "hung". Nothing calls this; do not start without a test that can
+# actually tell the two apart.
 decoder_is_hung() {
-    local dev=$1 tmp rc
+    local dev=$1 tmp rc w h
     tmp=$(mktemp -d) || return 1
+    read -r w h < <(pin_capture_format "$dev")
     settle
+    # Source caps pinned, and the scaling asked for separately: letting the one
+    # capsfilter do both would push 360x288 into the device. See
+    # pin_capture_format.
     timeout 10 gst-launch-1.0 -q v4l2src device="$dev" io-mode=mmap num-buffers=4 \
-        ! videoconvert ! video/x-raw,format=GRAY8,width=360,height=288 \
+        ! video/x-raw,width="$w",height="$h" \
+        ! videoconvert ! video/x-raw,format=GRAY8 \
+        ! videoscale ! video/x-raw,format=GRAY8,width=360,height=288 \
         ! multifilesink location="$tmp/f%02d.gray" >/dev/null 2>&1
     python3 - "$tmp" <<'PY'
 import sys, glob, statistics
