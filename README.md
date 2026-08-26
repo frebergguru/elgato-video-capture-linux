@@ -12,14 +12,17 @@ elgato-viewer --verify   # prove the picture is clean
 ```
 
 `./install.sh --no-driver` skips building the kernel module (rules and
-launchers only) and `--no-share` skips v4l2loopback, which only `--share`
-needs; `ELGATO_SKIP_SHARE=1` does the same.
+launchers only), `--no-share` skips v4l2loopback, which only `--share` needs
+(`ELGATO_SKIP_SHARE=1` does the same), and `-y` answers every prompt, for an
+unattended run.
 
-> **This builds and loads an out-of-tree kernel module.** It is unsigned, so it
-> taints the kernel and will not load under Secure Boot without signing. The
-> module writes decoder registers on one specific USB device; a bad setting can
-> leave the capture chip emitting nothing until it is power-cycled
-> (`elgato-viewer --reset`). There is no warranty — see LICENSE.
+> **This builds and loads an out-of-tree kernel module.** It taints the kernel,
+> and under Secure Boot it has to be signed to load at all — `install.sh` signs
+> it with an enrolled Machine Owner Key when the machine has one, and prints the
+> recipe to enrol your own when it does not. The module writes decoder registers
+> on one specific USB device; a bad setting can leave the capture chip emitting
+> nothing until it is power-cycled (`elgato-viewer --reset`). There is no
+> warranty — see LICENSE.
 
 ## The problem this fixes
 
@@ -56,7 +59,8 @@ bin/elgato-reset    power-cycle a wedged capture chip
 bin/elgato-obs-setup  write an OBS profile and scene collection for the card
 bin/elgato-driver   load the locally built module for this boot only
 libexec/elgato-player.py  the viewer's window and keys, incl. r and s
-lib/                shared helpers for the elgato-* helper scripts
+lib/elgato-common.sh  shared helpers for the elgato-* helper scripts
+lib/elgato-distro.sh  package names, root, module paths, per distribution
 driver/cx231xx/     patched cx231xx source
 driver/patches/     every deviation from the stock kernel tree, with rationale
 etc/                udev, modprobe, modules-load and WirePlumber configuration
@@ -233,10 +237,11 @@ reader that asks, which is why `elgato-audio` uses `pw-loopback`.
 [OBS.md](OBS.md) explains all three ways to work and why each setting is what it
 is.
 
-Keys need `python-gobject`, `gtk4` and `gst-plugin-gtk4`. Without them the viewer
-still plays, but there is nothing to press: `gst-launch-1.0` has no keyboard
-plumbing, and `waylandsink` does not implement `GstNavigation`, so a key press
-never reaches it. Close the window or press Ctrl-C instead.
+Keys need `python-gobject`, `gtk4` and `gst-plugin-gtk4` (Arch names — see
+[Requirements](#requirements)). Without them the viewer still plays, but there
+is nothing to press: `gst-launch-1.0` has no keyboard plumbing, and
+`waylandsink` does not implement `GstNavigation`, so a key press never reaches
+it. Close the window or press Ctrl-C instead.
 
 ### How it stays stable
 
@@ -410,22 +415,63 @@ applied — see above.
 
 ## Requirements
 
-Kernel headers for the running kernel, `v4l-utils`, GStreamer (`base`, `good`
-and a Wayland or X11 sink), PipeWire with `pw-loopback`, and `python3` for
-`--verify`. The module is unsigned, so it taints the kernel and will not load
-under Secure Boot without signing.
+Kernel headers for the running kernel, a C compiler and `make` to build the
+module against them, `v4l-utils`, GStreamer (`base`, `good` and a Wayland or
+X11 sink), PipeWire with `pw-loopback`, and `python3` for `--verify`. Being
+out-of-tree, the module taints the kernel whatever else is true of it, and
+under Secure Boot it has to be signed — see [Distributions](#distributions).
+
+Package names in this file are Arch's, since that is what it was written on.
+They differ elsewhere: `gst-libav` is `gstreamer1.0-libav` on Debian and
+`gstreamer1-libav` on Fedora, and so on. Rather than translating this list by
+hand, run `install.sh` — it checks for each tool and names the package for the
+distribution you are actually on, including which extra repository it needs
+where that applies.
 
 The `r` key additionally needs `gst-libav`, for the FFV1 encoder, and
 `--record-codec h264` needs `gst-plugins-ugly` for x264. Neither is required
 to watch: without them everything else works and `r` says which package is
 missing. `s` needs nothing beyond `good`.
 
-`--share` additionally needs the `v4l2loopback` module (`v4l2loopback-dkms` on
-Arch, which pulls in `dkms`); `install.sh` offers to install and configure it,
-and `install.sh --no-share` skips it. Nothing else depends on it.
-`v4l2loopback-utils` is installed alongside but is not required — it only adds
-inspection tools such as `v4l2loopback-ctl query`. Note that DKMS rebuilds the
-module against each new kernel only if that kernel's headers are installed.
+`--share` additionally needs the `v4l2loopback` module; `install.sh` offers to
+install and configure it under whatever name your distribution uses, and
+`install.sh --no-share` skips it. Nothing else depends on it. On Arch and
+Debian it arrives as `v4l2loopback-dkms`; on Fedora it is `akmod-v4l2loopback`
+from RPM Fusion, and on openSUSE `v4l2loopback-kmp-default` — `install.sh` says
+so if the repository it lives in is not enabled. `v4l2loopback-utils`, where
+there is one, is not required; it only adds inspection tools such as
+`v4l2loopback-ctl query`. Note that DKMS rebuilds the module against each new
+kernel only if that kernel's headers are installed.
+
+### Distributions
+
+`install.sh` and `uninstall.sh` are not tied to a distribution. They find the
+package manager by looking for it rather than by reading an ID, so derivatives
+work without being named — this was developed on Manjaro, which needs no case
+of its own — and every package name, the way to become root, and the module
+directory are decided at run time in `lib/elgato-distro.sh`.
+
+Arch, Debian, Ubuntu, Fedora, openSUSE, Void and Alpine are handled end to end,
+and were tested that way: both scripts run, install through uninstall, in a
+container of each. Gentoo is recognised and its package names are known, but
+Portage is left for you to drive — `install.sh` prints the `emerge` line rather
+than running it. On anything else everything that does not need a package
+manager still installs, and you are told what could not be named for you.
+
+Two things are worth knowing up front:
+
+- **Secure Boot.** Fedora, Ubuntu and openSUSE ship with it on, and it refuses
+  unsigned modules. `install.sh` signs the build with the machine's existing
+  Machine Owner Key if DKMS or akmods has already enrolled one, and otherwise
+  prints the `openssl` / `mokutil` recipe to enrol your own. Everything that is
+  not the kernel module installs either way.
+- **No systemd.** The udev rule hands the device over with `TAG+="uaccess"`,
+  which is logind's doing. Without logind, `install.sh` says so and points you
+  at the `video` group instead.
+
+Run them as yourself, never with `sudo` — both refuse to run as root, and
+escalate only the individual steps that need it. `sudo`, `doas` and plain `su`
+all work. `-y` answers every prompt, for unattended installs.
 
 ## Removing it
 
@@ -439,8 +485,9 @@ module against each new kernel only if that kernel's headers are installed.
 Nothing inside this directory is modified or deleted. Removing the patched
 driver brings the tearing back — the stock module has no `elgato_htl`. The
 v4l2loopback configuration is removed and the module unloaded, but the
-`v4l2loopback-dkms` package itself is left alone: pacman owns it and other
-software may be using it.
+v4l2loopback package itself is left alone: your package manager owns it and
+other software may be using it. `uninstall.sh` prints the removal command for
+your distribution if you want it gone.
 
 ## Credits
 

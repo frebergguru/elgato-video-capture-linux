@@ -7,9 +7,9 @@
 # udev rules, the v4l2loopback config, /etc/modprobe.d/cx231xx.conf and the
 # patched kernel module.
 #
-# The v4l2loopback *packages* are left installed -- pacman owns them, other
-# software may be using them, and removing them is your call, not this
-# script's. Only the configuration this package wrote is removed.
+# The v4l2loopback *packages* are left installed -- your package manager owns
+# them, other software may be using them, and removing them is your call, not
+# this script's. Only the configuration this package wrote is removed.
 #
 # Note what removing the module means: the stock in-tree cx231xx has no
 # elgato_htl knob, so the decoder's horizontal lock goes unprogrammed and the
@@ -22,7 +22,6 @@ set -uo pipefail
 
 SELF_DIR=$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd)
 KVER=$(uname -r)
-MOD_DIR="/lib/modules/$KVER/updates/cx231xx"
 TOOLS=(elgato-viewer elgato-audio elgato-doctor elgato-reset elgato-obs-setup
        elgato-driver)
 BIN_DIR="$HOME/.local/bin"
@@ -42,6 +41,24 @@ msg()  { printf '%s::%s %s\n' "$G" "$O" "$*"; }
 warn() { printf '%s!!%s %s\n' "$Y" "$O" "$*" >&2; }
 die()  { printf '%sxx%s %s\n' "$R" "$O" "$*" >&2; exit 1; }
 
+# shellcheck source=lib/elgato-distro.sh
+source "$SELF_DIR/lib/elgato-distro.sh" \
+    || die "lib/elgato-distro.sh is missing -- is this a complete checkout?"
+
+# install.sh wrote into whichever of /lib/modules and /usr/lib/modules this
+# system actually uses; look in the same place, and in the other one too, so an
+# install done before a usr-merge still cleans up. On a usr-merged system those
+# two are one directory, so compare resolved paths -- otherwise it is listed and
+# removed twice, which reads like two installs were found.
+MOD_DIRS=()
+for _root in "$(module_root "$KVER")" "/lib/modules/$KVER" "/usr/lib/modules/$KVER"; do
+    _d="$_root/updates/cx231xx"
+    [[ -d $_d ]] || continue
+    _d=$(readlink -f -- "$_d") || continue
+    [[ " ${MOD_DIRS[*]-} " == *" $_d "* ]] || MOD_DIRS+=("$_d")
+done
+unset _root _d
+
 ASSUME_YES=0
 KEEP_DRIVER=0
 while (( $# )); do
@@ -57,14 +74,13 @@ while (( $# )); do
     esac
 done
 
-[[ $EUID -eq 0 ]] && die "run this as yourself, not with sudo -- it calls sudo where needed"
+[[ $EUID -eq 0 ]] && die "run this as yourself, not with sudo -- it escalates where needed"
 
 echo
 msg "This will remove:"
-FOUND=0
 for t in "${TOOLS[@]}"; do
     if [[ -L $BIN_DIR/$t && $(readlink -f "$BIN_DIR/$t") == "$SELF_DIR"/* ]]; then
-        echo "    $BIN_DIR/$t"; FOUND=1
+        echo "    $BIN_DIR/$t"
     elif [[ -e $BIN_DIR/$t ]]; then
         echo "    ($BIN_DIR/$t points elsewhere -- will be left alone)"
     fi
@@ -73,15 +89,23 @@ done
 [[ -f $UDEV_RULE ]]  && echo "    $UDEV_RULE"
 if (( ! KEEP_DRIVER )); then
     [[ -f $MODPROBE_CONF ]] && echo "    $MODPROBE_CONF"
-    [[ -d $MOD_DIR ]]       && echo "    $MOD_DIR  (then reverts to the stock driver)"
+    for d in "${MOD_DIRS[@]-}"; do
+        [[ -n $d ]] && echo "    $d  (then reverts to the stock driver)"
+    done
 fi
 echo "    (nothing in $SELF_DIR)"
 echo
 
 if (( ! ASSUME_YES )); then
-    read -r -p "Proceed? [y/N] " reply
-    [[ ${reply,,} == y* ]] || { msg "Nothing done."; exit 0; }
+    if [[ -t 0 ]]; then
+        read -r -p "Proceed? [y/N] " reply
+        [[ ${reply,,} == y* ]] || { msg "Nothing done."; exit 0; }
+    else
+        die "not running on a terminal -- pass -y to remove without confirmation"
+    fi
 fi
+
+prime_root
 
 AUDIO_STOPPED=""
 release_audio() {
@@ -121,9 +145,9 @@ fi
 
 # --- 3. udev rule -----------------------------------------------------------
 if [[ -f $UDEV_RULE ]]; then
-    sudo rm -f "$UDEV_RULE" && msg "removed $UDEV_RULE"
-    sudo udevadm control --reload-rules
-    sudo udevadm trigger --subsystem-match=video4linux --subsystem-match=usb
+    as_root rm -f "$UDEV_RULE" && msg "removed $UDEV_RULE"
+    as_root udevadm control --reload-rules
+    as_root udevadm trigger --subsystem-match=video4linux --subsystem-match=usb
 fi
 
 # --- 4. the sharing loopback ------------------------------------------------
@@ -132,31 +156,39 @@ fi
 SHARE_REMOVED=0
 for f in "$SHARE_UDEV_RULE" "$SHARE_MODPROBE" "$SHARE_MODLOAD"; do
     [[ -f $f ]] || continue
-    sudo rm -f "$f" && msg "removed $f" && SHARE_REMOVED=1
+    as_root rm -f "$f" && msg "removed $f" && SHARE_REMOVED=1
 done
 if (( SHARE_REMOVED )); then
-    sudo udevadm control --reload-rules
-    sudo udevadm trigger --subsystem-match=video4linux
+    as_root udevadm control --reload-rules
+    as_root udevadm trigger --subsystem-match=video4linux
     if [[ -d /sys/module/v4l2loopback ]]; then
-        sudo modprobe -r v4l2loopback 2>/dev/null \
+        as_root modprobe -r v4l2loopback 2>/dev/null \
             && msg "unloaded v4l2loopback" \
             || warn "v4l2loopback is in use; it will be gone after a reboot"
     fi
-    msg "left the v4l2loopback packages installed -- remove them yourself if"
-    msg "nothing else wants them:  sudo pacman -Rns v4l2loopback-dkms v4l2loopback-utils"
+    if LOOPBACK_PKGS=$(pkg_for v4l2loopback); then
+        msg "left the v4l2loopback packages installed -- remove them yourself if"
+        # shellcheck disable=SC2086
+        msg "nothing else wants them:  $(pkg_remove_hint $LOOPBACK_PKGS)"
+    else
+        msg "left the v4l2loopback packages installed -- remove them yourself if"
+        msg "nothing else wants them"
+    fi
 fi
 
 # --- 5. driver and its options ----------------------------------------------
 if (( KEEP_DRIVER )); then
     msg "Left the patched driver and $MODPROBE_CONF in place (--keep-driver)"
 else
-    [[ -f $MODPROBE_CONF ]] && sudo rm -f "$MODPROBE_CONF" && msg "removed $MODPROBE_CONF"
-    if [[ -d $MOD_DIR ]]; then
+    [[ -f $MODPROBE_CONF ]] && as_root rm -f "$MODPROBE_CONF" && msg "removed $MODPROBE_CONF"
+    if (( ${#MOD_DIRS[@]} )); then
         release_audio
-        sudo modprobe -r cx231xx_alsa cx231xx 2>/dev/null
-        sudo rm -rf "$MOD_DIR" && msg "removed $MOD_DIR"
-        sudo depmod -a "$KVER" || warn "depmod failed"
-        sudo modprobe cx231xx 2>/dev/null && sudo modprobe cx231xx_alsa 2>/dev/null \
+        as_root modprobe -r cx231xx_alsa cx231xx 2>/dev/null
+        for d in "${MOD_DIRS[@]}"; do
+            as_root rm -rf "$d" && msg "removed $d"
+        done
+        as_root depmod -a "$KVER" || warn "depmod failed"
+        as_root modprobe cx231xx 2>/dev/null && as_root modprobe cx231xx_alsa 2>/dev/null \
             && msg "reloaded the stock in-tree driver" \
             || warn "could not reload cx231xx -- reboot to finish"
         restore_audio
