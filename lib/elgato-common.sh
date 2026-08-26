@@ -18,9 +18,18 @@ SHARE_DEV_DEFAULT="/dev/elgato-share"
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/elgato"
 CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/elgato.conf"
 
-msg()  { printf '\033[1;36m::\033[0m %s\n' "$*" >&2; }
-warn() { printf '\033[1;33m!!\033[0m %s\n' "$*" >&2; }
-die()  { printf '\033[1;31mxx\033[0m %s\n' "$*" >&2; exit 1; }
+# Colour only on a terminal. These messages are routinely redirected to a file
+# or piped into a bug report, and raw escapes there are noise -- install.sh and
+# elgato-viewer already guard theirs the same way.
+if [[ -t 2 ]]; then
+    E_CYA=$'\033[1;36m'; E_YEL=$'\033[1;33m'; E_RED=$'\033[1;31m'; E_OFF=$'\033[0m'
+else
+    E_CYA=''; E_YEL=''; E_RED=''; E_OFF=''
+fi
+
+msg()  { printf '%s::%s %s\n' "$E_CYA" "$E_OFF" "$*" >&2; }
+warn() { printf '%s!!%s %s\n' "$E_YEL" "$E_OFF" "$*" >&2; }
+die()  { printf '%sxx%s %s\n' "$E_RED" "$E_OFF" "$*" >&2; exit 1; }
 
 # --- device discovery -------------------------------------------------------
 # Never hardcode /dev/video4: the number shifts when the built-in webcam
