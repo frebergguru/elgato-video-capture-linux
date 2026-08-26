@@ -27,13 +27,25 @@ is_running() {
     [[ -n $pid ]] && kill -0 "$pid" 2>/dev/null
 }
 
+# The pids of OUR loopbacks, and nobody else's.
+#
+# pw-loopback is a general-purpose tool: a headset sidetone, a virtual mixer,
+# somebody else's project may all be running one. Matching the process name
+# alone -- which is what this used to do -- means "elgato-audio stop" kills
+# them too, and the viewer runs that on the way out of every session. Match on
+# the node name start() gives its capture side instead, which appears in the
+# command line and is ours by construction.
+OUR_LOOPBACK='pw-loopback.*node\.name=elgato-audio-in'
+
+our_loopback_pids() { pgrep -f "$OUR_LOOPBACK" 2>/dev/null; }
+
 start() {
     # A stale loopback whose pid file was overwritten would otherwise survive
     # and stack with the new one.
     local strays
     # pgrep -c prints the count AND exits non-zero when the count is zero, so
     # "|| echo 0" would append a second line and break the arithmetic test.
-    strays=$(pgrep -xc pw-loopback 2>/dev/null)
+    strays=$(pgrep -cf "$OUR_LOOPBACK" 2>/dev/null)
     [[ -z $strays ]] && strays=0
     if is_running && [[ ${strays:-0} -le 1 ]]; then
         msg "Audio loopback already running (pid $(<"$PID_FILE"))."
@@ -110,7 +122,8 @@ start() {
     return 0
 }
 
-# Kill every loopback of ours, not just the one in the pid file.
+# Kill every loopback of ours, not just the one in the pid file. Ours only --
+# see OUR_LOOPBACK.
 #
 # Orphans accumulate whenever the caller dies without running its cleanup, and
 # the pid file only ever tracks the most recent one. Several loopbacks feeding
@@ -118,7 +131,7 @@ start() {
 # offsets, which comb-filters into exactly the "garbage audio" symptom.
 kill_strays() {
     local pids
-    pids=$(pgrep -x pw-loopback 2>/dev/null)
+    pids=$(our_loopback_pids)
     [[ -z $pids ]] && return 0
     local n; n=$(wc -w <<< "$pids")
     [[ -z $n ]] && n=0
