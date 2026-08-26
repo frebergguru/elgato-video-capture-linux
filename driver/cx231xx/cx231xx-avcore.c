@@ -1106,11 +1106,18 @@ static void cx231xx_elgato_v2_htl(struct cx231xx *dev)
  * HTL_CTRL ends at 0x00000802 in all of them.  The only thing running it adds
  * is a 25ms delay on every standard change.
  *
- * The picture metric cannot arbitrate this and was not asked to: on the source
- * available when this was measured, elgato_htl=0 already scored 0.0% of frames
- * corrupt over 8 runs of 150 frames, so that source does not exercise the
- * tearing fault at all.  The register trace above does not depend on the
- * source.
+ * The picture metric cannot arbitrate this, and the reason is worth recording
+ * because it looked like the opposite at first.  elgato-viewer --verify scored
+ * 0.0% of frames corrupt at elgato_htl=0 over 8 runs of 150 frames, from
+ * power-on defaults rather than inherited state.  That was read as "this
+ * source does not provoke the fault".  It was wrong: PNG stills of the very
+ * same capture are catastrophically torn -- whole raster sheared diagonally,
+ * text duplicated at a horizontal offset, rainbow striping in columns --
+ * reproducibly, across two independent power cycles.  --verify simply does not
+ * see it; its threshold is absolute while its statistic is content-dependent,
+ * so on dark low-chroma material a torn frame scores about 3 against a
+ * threshold of 9.  The conclusion above rests on the register trace, which
+ * does not depend on the source or on that metric.
  *
  * If it is ever revived, it has to *replace* _htl(), not follow it, and it
  * needs a decoder that does not already report lock.

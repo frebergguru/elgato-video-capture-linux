@@ -635,17 +635,28 @@ if n < 4:
 # frames inspected by eye: clean scored 2.6, corrupt 13.5.
 stride = w * 2
 
+# Returns (mean, worst-5%). The mean is the historical figure and still the
+# pass/fail one, so scores stay comparable with everything measured before.
+# The percentile is reported beside it because the mean has a measured blind
+# spot: it averages the whole frame, so on dark low-chroma material -- a
+# console title screen on black -- frames that are visibly sheared and carry
+# duplicated text score about 3 against THRESH 9 and pass. Same frames, worst
+# 5% of samples: 21. The threshold is absolute while the statistic is
+# content-dependent, which is the flaw.
 def chroma_score(fi):
     base = fi * sz
-    tot = cnt = 0
+    vals = []
     for y in range(20, h - 2, STEP_ROW):
         o1 = base + y * stride
         o2 = base + (y + 2) * stride
         for x in range(0, w * 2 - 4, 4 * STEP_PIX):
-            tot += abs(data[o1 + x + 1] - data[o2 + x + 1])   # U
-            tot += abs(data[o1 + x + 3] - data[o2 + x + 3])   # V
-            cnt += 2
-    return tot / cnt if cnt else 0.0
+            vals.append(abs(data[o1 + x + 1] - data[o2 + x + 1]))   # U
+            vals.append(abs(data[o1 + x + 3] - data[o2 + x + 3]))   # V
+    if not vals:
+        return 0.0, 0.0
+    vals.sort()
+    return (sum(vals) / len(vals),
+            float(vals[min(len(vals) - 1, int(len(vals) * 0.95))]))
 
 # A black or disconnected input has perfectly coherent chroma -- zero
 # variation everywhere -- and would otherwise score a clean 0% corrupt. Refuse
@@ -673,7 +684,9 @@ if detail < 5.0:
         print("  lead is seated, then run this again.")
     sys.exit(3)
 
-scores = [chroma_score(i) for i in range(n)]
+pairs = [chroma_score(i) for i in range(n)]
+scores = [m for m, _ in pairs]
+peaks = [p for _, p in pairs]
 bad = sum(1 for v in scores if v > THRESH)
 pct = 100.0 * bad / n
 lo, hi = min(scores), max(scores)
@@ -685,6 +698,11 @@ if mode != "report":
 print(f"  frames analysed : {n}")
 print(f"  corrupt frames  : {bad} of {n}  ({pct:.1f}%)")
 print(f"  chroma spread   : {lo:.1f} (best frame) .. {hi:.1f} (worst)  threshold {THRESH}")
+# Reported, not judged: no threshold has been calibrated for it on raw YUYV.
+# A known-good capture of this hardware measures 14.0 here, so the mean's
+# threshold of 9.0 emphatically does NOT transfer to this statistic.
+print(f"  worst 5% samples: {min(peaks):.1f} .. {max(peaks):.1f}"
+      f"   (uncalibrated; good captures measure ~14 -- for comparing runs only)")
 print()
 if pct > 5.0:
     print("  VERDICT: BROKEN -- corrupt frames show rainbow striping, i.e. the")
@@ -692,6 +710,13 @@ if pct > 5.0:
     print("  colour fields. This is below the player: raw v4l2 capture shows it.")
     sys.exit(2)
 print("  VERDICT: OK -- colour is coherent line to line on every frame.")
+print()
+print("  This test has a known blind spot: the figure above is a frame AVERAGE")
+print("  against an absolute threshold, so damage confined to part of the")
+print("  picture is diluted. Measured on a console title screen, elgato_htl=0")
+print("  scored 0.0% corrupt here while stills of that same capture were")
+print("  sheared diagonally with text duplicated, 20 frames out of 20. A pass")
+print("  is not proof; look at the picture, or save a still with the s key.")
 PYEOF
     local rc=$?
     rm -f "$raw"
@@ -951,10 +976,15 @@ tune_sweep() {
     warn "To compare configurations honestly, power-cycle between each:"
     warn "    elgato-reset  then  elgato-viewer --verify   once per config."
     echo
-    warn "And check the sweep can see anything at all before reading into it:"
-    warn "a source that does not provoke the fault scores 0.0% on every config,"
-    warn "including elgato_htl=0. Confirm elgato_htl=0 measures BADLY on your"
-    warn "source -- from a power cycle -- or the table below is all noise."
+    warn "And do not read a low figure as proof a config is good. This metric"
+    warn "has a measured blind spot: its statistic is the MEAN chroma"
+    warn "difference between lines two apart, but the threshold is absolute, so"
+    warn "on dark low-chroma material a badly torn frame scores about 3 against"
+    warn "a threshold of 9 and passes. Measured: elgato_htl=0 on a console title"
+    warn "screen scored 0.0% corrupt across 20 frames while PNG stills of that"
+    warn "same capture were sheared diagonally with text duplicated -- 20 of 20"
+    warn "frames visibly ruined. Look at the picture, or save a still with the"
+    warn "s key, before trusting any row in this table."
     echo
     msg "Sweeping ${#TUNE_CONFIGS[@]} configurations (~20s each)."
     msg "Figure is % of frames corrupt; <= 5% means the picture is stable."
